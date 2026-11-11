@@ -92,7 +92,7 @@ void VMImpl::buildHandlerTable() {
 		// runtime vsel can never select an unwired CALL variant; all other
 		// opcodes keep full intra-function variant diversity.
 		bool IsCall = (L == OP_CALL_VOID || L == OP_CALL_INT || L == OP_CALL_PTR ||
-					   L == OP_CALL_INT64 || L == OP_CALL_F);
+					   L == OP_CALL_INT64 || L == OP_CALL_F || L == OP_CALL_PAIR);
 		for (unsigned v = 0; v < K; ++v) {
 			unsigned VB = (K > 1 && IsCall) ? (K - 1) : v;
 			BasicBlock* HB = SharedEngineMode ? SS->OpcBB[L][VB]
@@ -687,8 +687,9 @@ void VMImpl::ensureCallFTyCases() {
 	LLVM_DEBUG(dbgs() << "[vm] extending CALL switches: " << OldCount
 		<< " -> " << NewCount << " FunctionTypes\n");
 
-	// For each CALL opcode (indexed by RetKind2 0..4):
-	for (unsigned RKIdx = 0; RKIdx < 5; ++RKIdx) {
+	// For each CALL opcode (indexed by RetKind2 0..NumRetKinds-1):
+	Type* PairTy = StructType::get(Ctx, { PtrTy, I64Ty });
+	for (unsigned RKIdx = 0; RKIdx < VMEngine::NumRetKinds; ++RKIdx) {
 		auto& CSW = SS->CallSW[RKIdx];
 		if (!CSW.SW) continue;  // this CALL opcode wasn't built
 
@@ -698,6 +699,7 @@ void VMImpl::ensureCallFTyCases() {
 			: (RK == VMEngine::RK2_I64) ? (Type*)I64Ty
 			: (RK == VMEngine::RK2_F64) ? (Type*)DoubleTy
 			: (RK == VMEngine::RK2_I32) ? (Type*)I32Ty
+			: (RK == VMEngine::RK2_PAIR) ? (Type*)PairTy
 			: (Type*)Type::getVoidTy(Ctx);
 
 		for (unsigned TIdx = OldCount; TIdx < NewCount; ++TIdx) {

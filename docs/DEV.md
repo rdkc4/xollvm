@@ -470,7 +470,7 @@ reference is in [VM.md](VM.md); this section focuses on the implementation struc
 ### Module-level shared engine
 
 To minimise binary size overhead when multiple functions are virtualised, all opcode handlers
-(56 as of `OP_COUNT = 0x38` in `VMPass_ISA.h` — check that constant directly, it grows with every
+(58 as of `OP_COUNT = 0x3A` in `VMPass_ISA.h` — check that constant directly, it grows with every
 new fused/decoy/stack opcode and this doc will drift again) live in a module-level function
 `__vm_engine()`. With `enginePoolSize > 1` there are `N` structurally-independent engines instead
 of one shared one (see hardening layers below). Each engine is created once per module (by

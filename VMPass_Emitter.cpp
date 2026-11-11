@@ -38,18 +38,27 @@ static inline bool isBranchOpcode(unsigned Op) {
 STATISTIC(VMBytecodeBytes, "Total bytecode bytes emitted (v7)");
 STATISTIC(VMVirtRegs, "Virtual register slots allocated (v7)");
 
+// Exact {ptr, i64} aggregate — OP_CALL_PAIR + extractvalue slot alias.
+static bool isPtrI64PairTy(Type* Ty) {
+	auto* ST = dyn_cast<StructType>(Ty);
+	if (!ST || ST->getNumElements() != 2) return false;
+	return ST->getElementType(0)->isPointerTy() &&
+		ST->getElementType(1)->isIntegerTy(64);
+}
+
 // isize / bsize / emit(Instruction) / emit(BasicBlock) / run() 
 
 uint32_t BytecodeEmitter::isize(Instruction* I) {
 	if (isa<AllocaInst>(I) || isa<UnreachableInst>(I)) return 0;
 	unsigned Op = I->getOpcode(); Type* Ty = I->getType();
-	// i32/i64 binops (separate opcodes for i32 vs i64)
+	// Integer binops: BW≤32 share OP_BINOP / i32 vreg file; i64 → OP_BINOP64.
 	if (Op == Instruction::Add || Op == Instruction::Sub || Op == Instruction::Mul ||
 		Op == Instruction::And || Op == Instruction::Or || Op == Instruction::Xor ||
 		Op == Instruction::Shl || Op == Instruction::LShr || Op == Instruction::AShr ||
 		Op == Instruction::SDiv || Op == Instruction::UDiv ||
 		Op == Instruction::SRem || Op == Instruction::URem) {
-		if (Ty->isIntegerTy(32) || Ty->isIntegerTy(64)) return 5;
+		if (Ty->isIntegerTy() && Ty->getIntegerBitWidth() <= 32) return 5;
+		if (Ty->isIntegerTy(64)) return 5;
 		markUnsupported(I); return 0;
 	}
 	// float binary ops
@@ -97,12 +106,21 @@ uint32_t BytecodeEmitter::isize(Instruction* I) {
 		Type* T1 = CI->getOperand(1)->getType();
 		if (T0->isIntegerTy(32) && T1->isIntegerTy(32)) return 5;
 		if (T0->isIntegerTy(64) && T1->isIntegerTy(64)) return 5;
+		if (T0->isPointerTy() && T1->isPointerTy()) {
+			auto P = CI->getPredicate();
+			if (P == ICmpInst::ICMP_EQ || P == ICmpInst::ICMP_NE) return 5;
+		}
 		markUnsupported(I); return 0;
 	}
 
 	if (Op == Instruction::ZExt) {
 		unsigned W = I->getOperand(0)->getType()->getIntegerBitWidth();
-		if (Ty->isIntegerTy(32) && (W == 1 || W == 8 || W == 16)) return 4;
+		unsigned DW = Ty->isIntegerTy() ? Ty->getIntegerBitWidth() : 0;
+		// Narrow→narrow (and →i32) within i32 vreg file: CK_ZEXT* masks LSB.
+		if (Ty->isIntegerTy() && DW <= 32 && DW > W &&
+			(W == 1 || W == 8 || W == 16) &&
+			(DW == 8 || DW == 16 || DW == 32))
+			return 4;
 		if (Ty->isIntegerTy(64) && (W == 1 || W == 8 || W == 16 || W == 32)) return 4;
 		markUnsupported(I); return 0;
 	}
@@ -177,6 +195,8 @@ uint32_t BytecodeEmitter::isize(Instruction* I) {
 		markUnsupported(I); return 0;
 	}
 	if (Op == Instruction::Load) {
+		// i1: OP_LOAD8 (3) + OP_CAST CK_TRUNC1 (4) so the vreg is 0/1.
+		if (Ty->isIntegerTy(1)) return 7;
 		if (Ty->isIntegerTy(8) || Ty->isIntegerTy(16) ||
 			Ty->isIntegerTy(32) || Ty->isIntegerTy(64) ||
 			Ty->isPointerTy() ||
@@ -189,7 +209,8 @@ uint32_t BytecodeEmitter::isize(Instruction* I) {
 	if (Op == Instruction::Store) {
 		auto* SI = cast<StoreInst>(I);
 		Type* VT = SI->getValueOperand()->getType();
-		if (VT->isIntegerTy(8) || VT->isIntegerTy(16) ||
+		// i1 stores as 1 byte via OP_STORE8 (LSB of i32 vreg).
+		if (VT->isIntegerTy(1) || VT->isIntegerTy(8) || VT->isIntegerTy(16) ||
 			VT->isIntegerTy(32) || VT->isIntegerTy(64) ||
 			VT->isPointerTy())
 			return 3;
@@ -253,16 +274,27 @@ uint32_t BytecodeEmitter::isize(Instruction* I) {
 			markUnsupported(I); return 0;
 		}
 		if (NA > 16) { markUnsupported(I, "CALL arg count exceeds MaxArgs (16)"); return 0; }
+		// Indirect: extra preg byte after nargs (bit 7 of nargs).
+		unsigned Ind = isa<Constant>(CI->getCalledOperand()) ? 0u : 1u;
 		// encoding: [dst?] fn:u8 nargs:u8 flags:u8 types:u16le [arg:u8 * nargs]
 		// flags(1) + types(2) = 3 header bytes (was 2: nargs + types_u8)
 		const unsigned Hdr = 3 + NA;  // fn + nargs + flags + types_lo + types_hi + args... wait
 		// Actually: fn(1) + nargs(1) + flags(1) + types_lo(1) + types_hi(1) + args(NA) = 5+NA
 		(void)Hdr;
-		if (Ty->isVoidTy())         return 6 + NA;  // opc + fn + nargs + flags + tylo + tyhi + args
+		if (Ty->isVoidTy())         return 6 + NA + Ind;
 		// Narrow ints (i1/i8/i16) share OP_CALL_INT / the i32 vreg file with i32.
-		if ((Ty->isIntegerTy() && Ty->getIntegerBitWidth() <= 32) || Ty->isPointerTy()) return 7 + NA;  // dst + above
-		if (Ty->isIntegerTy(64))    return 7 + NA;  // OP_CALL_INT64
-		if (Ty->isFloatTy() || Ty->isDoubleTy()) return 7 + NA;  // OP_CALL_F
+		if ((Ty->isIntegerTy() && Ty->getIntegerBitWidth() <= 32) || Ty->isPointerTy()) return 7 + NA + Ind;
+		if (Ty->isIntegerTy(64))    return 7 + NA + Ind;  // OP_CALL_INT64
+		if (Ty->isFloatTy() || Ty->isDoubleTy()) return 7 + NA + Ind;  // OP_CALL_F
+		if (isPtrI64PairTy(Ty))     return 8 + NA + Ind;  // OP_CALL_PAIR: two dsts
+		markUnsupported(I); return 0;
+	}
+	if (Op == Instruction::ExtractValue) {
+		auto* EVI = cast<ExtractValueInst>(I);
+		if (EVI->getNumIndices() == 1 && isPtrI64PairTy(EVI->getAggregateOperand()->getType())) {
+			unsigned Idx = EVI->getIndices()[0];
+			if (Idx <= 1) return 0;  // slot alias — no bytes
+		}
 		markUnsupported(I); return 0;
 	}
 	if (isBranchOpcode(Op))
@@ -493,8 +525,9 @@ void BytecodeEmitter::emit(Instruction* I) {
 		Op == Instruction::Shl || Op == Instruction::LShr || Op == Instruction::AShr ||
 		Op == Instruction::SDiv || Op == Instruction::UDiv ||
 		Op == Instruction::SRem || Op == Instruction::URem) {
-		if (!(Ty->isIntegerTy(32) || Ty->isIntegerTy(64))) { markUnsupported(I); return; }
 		const bool Is64 = Ty->isIntegerTy(64);
+		const bool IsNarrow = Ty->isIntegerTy() && Ty->getIntegerBitWidth() <= 32;
+		if (!(IsNarrow || Is64)) { markUnsupported(I); return; }
 		static const unsigned OL[] = { Instruction::Add,Instruction::Sub,Instruction::Mul,
 			Instruction::And,Instruction::Or,Instruction::Xor,
 			Instruction::Shl,Instruction::LShr,Instruction::AShr,
@@ -643,6 +676,18 @@ void BytecodeEmitter::emit(Instruction* I) {
 			return;
 
 		}
+		if (T0->isPointerTy() && T1->isPointerTy()) {
+			auto P = CI->getPredicate();
+			if (P != ICmpInst::ICMP_EQ && P != ICmpInst::ICMP_NE) {
+				markUnsupported(I); return;
+			}
+			bop(OP_ICMP_PTR);
+			b8(xorSalt(newVR(I)));
+			b8(xorSalt(pr(CI->getOperand(0))));
+			b8(xorSalt(pr(CI->getOperand(1))));
+			b8(encIcmpPred((uint8_t)P));
+			return;
+		}
 
 		markUnsupported(I);
 		return;
@@ -651,8 +696,12 @@ void BytecodeEmitter::emit(Instruction* I) {
 
 	if (Op == Instruction::ZExt) {
 		unsigned W = I->getOperand(0)->getType()->getIntegerBitWidth();
-		if (Ty->isIntegerTy(32)) {
-			if (W != 1 && W != 8 && W != 16) { markUnsupported(I); return; }
+		unsigned DW = Ty->isIntegerTy() ? Ty->getIntegerBitWidth() : 0;
+		// Dest BW∈{8,16,32} from src {1,8,16}: CK_ZEXT* keyed by *src* width
+		// (i1→i8/i16/i32 all use CK_ZEXT1 — AND 1 into the shared i32 file).
+		if (Ty->isIntegerTy() && DW <= 32 && DW > W &&
+			(W == 1 || W == 8 || W == 16) &&
+			(DW == 8 || DW == 16 || DW == 32)) {
 			CastKind K = (W == 1) ? CK_ZEXT1 : (W == 8) ? CK_ZEXT8 : CK_ZEXT16;
 			bop(OP_CAST); b8(xorSalt(newVR(I))); b8(xorSalt(vr(I->getOperand(0)))); b8(encCastKind((uint8_t)K)); return;
 		}
@@ -812,8 +861,14 @@ void BytecodeEmitter::emit(Instruction* I) {
 		if (!I->getOperand(0)->getType()->isIntegerTy(32)) { markUnsupported(I); return; }
 		bop(OP_INTTOPTR); b8(xorSalt(newPR(I))); b8(xorSalt(vr(I->getOperand(0)))); return;
 	}
-	if (Op == Instruction::Load && Ty->isIntegerTy(8)) {
-		bop(OP_LOAD8); b8(xorSalt(newVR(I))); b8(xorSalt(pr(cast<LoadInst>(I)->getPointerOperand()))); return;
+	if (Op == Instruction::Load && (Ty->isIntegerTy(1) || Ty->isIntegerTy(8))) {
+		uint8_t D = newVR(I);
+		bop(OP_LOAD8); b8(xorSalt(D)); b8(xorSalt(pr(cast<LoadInst>(I)->getPointerOperand())));
+		// load i1: byte in memory, keep only the low bit (CK_TRUNC1) in the same slot.
+		if (Ty->isIntegerTy(1)) {
+			bop(OP_CAST); b8(xorSalt(D)); b8(xorSalt(D)); b8(encCastKind((uint8_t)CK_TRUNC1));
+		}
+		return;
 	}
 	if (Op == Instruction::Load && Ty->isIntegerTy(16)) {
 		bop(OP_LOAD16); b8(xorSalt(newVR(I))); b8(xorSalt(pr(cast<LoadInst>(I)->getPointerOperand()))); return;
@@ -839,7 +894,8 @@ void BytecodeEmitter::emit(Instruction* I) {
 	if (Op == Instruction::Store) {
 		auto* SI = cast<StoreInst>(I);
 		Type* VT = SI->getValueOperand()->getType();
-		if (VT->isIntegerTy(8)) {
+		// i1 and i8 both store one byte via OP_STORE8.
+		if (VT->isIntegerTy(1) || VT->isIntegerTy(8)) {
 			bop(OP_STORE8); b8(xorSalt(vr(SI->getValueOperand()))); b8(xorSalt(pr(SI->getPointerOperand()))); return;
 		}
 		if (VT->isIntegerTy(16)) {
@@ -950,7 +1006,18 @@ void BytecodeEmitter::emit(Instruction* I) {
 			ConcreteArgTys.push_back(CI->getArgOperand(A)->getType());
 		FunctionType* ConcreteFTy = FunctionType::get(
 			CI->getType(), ConcreteArgTys, CI->getFunctionType()->isVarArg());
-		uint8_t FI = callee(Fn, ConcreteFTy);
+		// Only Constants go into the callee global. An indirect target is an
+		// instruction; stripBody() deletes it before that global is built.
+		const bool IndCall = !isa<Constant>(Fn);
+		uint8_t IndPreg = 0;
+		if (IndCall) {
+			if (!PR.count(Fn)) {
+				markUnsupported(I, "indirect callee not in preg file");
+				return;
+			}
+			IndPreg = pr(Fn);
+		}
+		uint8_t FI = IndCall ? indirectCalleeSlot(ConcreteFTy) : callee(Fn, ConcreteFTy);
 		unsigned NAw = CI->arg_size();
 		if (NAw > 16) {
 			markUnsupported(I, "CALL arg count exceeds MaxArgs (16)");
@@ -977,9 +1044,19 @@ void BytecodeEmitter::emit(Instruction* I) {
 		else if (Ty->isFloatTy() || Ty->isDoubleTy()) {
 			bop(OP_CALL_F);     b8(xorSalt(newFR(I)));
 		}
+		else if (isPtrI64PairTy(Ty)) {
+			uint8_t DP = newPR(I);
+			uint8_t D64 = newVR64(I);
+			PairSlots[I] = { DP, D64 };
+			bop(OP_CALL_PAIR);
+			b8(xorSalt(DP));
+			b8(xorSalt(D64));
+		}
 		else { markUnsupported(I); return; }
-		// Common header: fn, nargs  (flags/argtypes removed -- now in GVFTyIndices)
-		b8(FI); b8(NA);
+		// Common header: fn, nargs. Bit 7 of nargs = indirect: next byte is the
+		// preg holding the callee pointer. fn still indexes the FTy table.
+		b8(FI); b8(IndCall ? (uint8_t)(NA | 0x80) : NA);
+		if (IndCall) b8(xorSalt(IndPreg));
 
 		// Per-arg register indices
 		for (unsigned A = 0; A < NA; ++A) {
@@ -990,6 +1067,22 @@ void BytecodeEmitter::emit(Instruction* I) {
 			else if (AT->isFloatTy() || AT->isDoubleTy()) b8(xorSalt(fr(Arg)));
 			else										  b8(xorSalt(vr(Arg)));
 		}
+		return;
+	}
+
+	if (Op == Instruction::ExtractValue) {
+		auto* EVI = cast<ExtractValueInst>(I);
+		Value* Agg = EVI->getAggregateOperand();
+		if (EVI->getNumIndices() != 1 || !isPtrI64PairTy(Agg->getType())) {
+			markUnsupported(I); return;
+		}
+		unsigned Idx = EVI->getIndices()[0];
+		if (Idx > 1) { markUnsupported(I); return; }
+		auto PIt = PairSlots.find(Agg);
+		if (PIt == PairSlots.end()) { markUnsupported(I, "extractvalue of untracked {ptr,i64}"); return; }
+		// Slot alias: reuse call's preg / vreg64 — no bytecode.
+		if (Idx == 0) PR[I] = PIt->second.first;
+		else          VR64[I] = PIt->second.second;
 		return;
 	}
 
@@ -1064,12 +1157,15 @@ bool BytecodeEmitter::run(Function& F, uint8_t S, const DataLayout& D) {
 	PR.clear();
 	CalleeTab.clear();
 	CalleeFTyTab.clear();
+	IndFTySlot.clear();
+	IndSlots.clear();
 	PHIAllocas.clear();
 	ImmLoads.clear();
 	ImmLoads64.clear();
 	PtrLoads.clear();
 	FR.clear();
 	ImmLoadsF.clear();
+	PairSlots.clear();
 	Fixups.clear();
 	NVR = NVR64 = NPR = NFR = 0;
 	FusedAddToMul.clear();
@@ -1188,6 +1284,25 @@ bool BytecodeEmitter::run(Function& F, uint8_t S, const DataLayout& D) {
 			// float/double → freg file
 			if (Ty->isFloatTy() || Ty->isDoubleTy()) { newFR(&I); continue; }
 
+			// {ptr, i64} call result → dual slots; extractvalue aliases them.
+			if (isPtrI64PairTy(Ty)) {
+				uint8_t DP = newPR(&I);
+				uint8_t D64 = newVR64(&I);
+				PairSlots[&I] = { DP, D64 };
+				continue;
+			}
+			if (auto* EVI = dyn_cast<ExtractValueInst>(&I)) {
+				Value* Agg = EVI->getAggregateOperand();
+				if (EVI->getNumIndices() == 1 && isPtrI64PairTy(Agg->getType())) {
+					unsigned Idx = EVI->getIndices()[0];
+					auto PIt = PairSlots.find(Agg);
+					if (PIt != PairSlots.end() && Idx <= 1) {
+						if (Idx == 0) PR[&I] = PIt->second.first;
+						else          VR64[&I] = PIt->second.second;
+						continue;
+					}
+				}
+			}
 
 			// Any other result type is not representable in the current VM ISA.
 			markUnsupportedValue(&I);

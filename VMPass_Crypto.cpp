@@ -243,7 +243,14 @@ void VMImpl::buildCalleeGlobal() {
 
 	// Existing: emit GVCallees [C x ptr]
 	SmallVector<Constant*, 8> Cs;
-	for (Value* V : E.CalleeTab) Cs.push_back(cast<Constant>(V));
+	for (Value* V : E.CalleeTab) {
+		// Callee global initializers must be Constants. An instruction here
+		// is a use-after-free once stripBody() has run and crashes AsmPrinter.
+		if (auto* C = dyn_cast<Constant>(V))
+			Cs.push_back(C);
+		else
+			Cs.push_back(ConstantPointerNull::get(cast<PointerType>(PtrTy)));
+	}
 	auto* ATy = ArrayType::get(PtrTy, Cs.size());
 	// writable when hardened (callee XOR ctor modifies in-place)
 	GVCallees = new GlobalVariable(M, ATy,

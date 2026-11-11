@@ -241,8 +241,9 @@ namespace llvm {
 		void markEnginePopulated(Function* VMEngineFunc);
 
 		// CALL handler types (hoisted from VMImpl for SharedState visibility)
-		enum RetKind2 { RK2_VOID = 0, RK2_I32 = 1, RK2_PTR = 2, RK2_I64 = 3, RK2_F64 = 4 };
+		enum RetKind2 { RK2_VOID = 0, RK2_I32 = 1, RK2_PTR = 2, RK2_I64 = 3, RK2_F64 = 4, RK2_PAIR = 5 };
 		static constexpr unsigned MaxArgs = 16;
+		static constexpr unsigned NumRetKinds = 6;
 
 		// Module-level shared state for the vm_engine
 		struct SharedState {
@@ -270,12 +271,13 @@ namespace llvm {
 			struct CallSwitchInfo {
 				SwitchInst* SW = nullptr;
 				BasicBlock* MergeBB = nullptr;
-				PHINode* RetPHI = nullptr;
+				PHINode* RetPHI = nullptr;     // single-ret kinds; ptr half of PAIR
+				PHINode* RetPHI64 = nullptr;   // i64 half of RK2_PAIR only
 				Value* Callee = nullptr;
 				SmallVector<Value*, 8> PVals, IVals, I64Vs, FregVals;
 				RetKind2    RK = RK2_VOID;
 			};
-			CallSwitchInfo CallSW[5];
+			CallSwitchInfo CallSW[NumRetKinds];
 
 			bool Populated = false;
 			unsigned FTyCountAtLastBuild = 0;
@@ -906,6 +908,7 @@ namespace llvm {
 		static constexpr auto RK2_PTR = VMEngine::RK2_PTR;
 		static constexpr auto RK2_I64 = VMEngine::RK2_I64;
 		static constexpr auto RK2_F64 = VMEngine::RK2_F64;
+		static constexpr auto RK2_PAIR = VMEngine::RK2_PAIR;
 		static constexpr unsigned MaxArgs = VMEngine::MaxArgs;
 
 		void stripBody();
@@ -921,7 +924,7 @@ namespace llvm {
 		void buildHandlersMem();       // LOAD*/STORE* (all widths)  GEP*  LOADPTR  STOREPTR
 		void buildHandlersControl();   // JMP JMPC SWITCH  RET_VOID RET_INT RET_PTR
 		void buildHandlersFloat();     // all float/freg opcodes (LOADI_F .. FNEG)
-		void buildHandlersCall();      // CALL_VOID CALL_INT CALL_PTR CALL_INT64 CALL_F
+		void buildHandlersCall();      // CALL_VOID CALL_INT CALL_PTR CALL_INT64 CALL_F CALL_PAIR
 		void buildCall2(VMOp Opc, const Twine& Name, llvm::VMEngine::RetKind2 RK);
 
 		// M3: static decoy handlers (VMPass_Decoys.cpp). computeNumDecoys()

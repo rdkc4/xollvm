@@ -84,16 +84,21 @@ namespace llvm {
 			};
 
 
-		// shared CALL verifier body -- used by all 5 CALL opcodes.
+		// shared CALL verifier body -- used by all CALL opcodes.
 		// Encoding: [dst?] fn:u8 nargs:u8 [arg:u8 * nargs]
+		// PAIR: [dstp dst64] fn nargs [args...]
 		// (flags/argtypes bytes removed -- FunctionType now comes from GVFTyIndices)
 		auto verifyCall = [&](uint32_t IP, unsigned DstKind) -> bool {
-			// DstKind: 0=void, 1=vreg, 2=preg, 3=vreg64, 4=freg
+			// DstKind: 0=void, 1=vreg, 2=preg, 3=vreg64, 4=freg, 5=pair(preg+vreg64)
+			const bool IsPair = (DstKind == 5);
 			const bool HasDst = (DstKind != 0);
-			uint32_t Hdr = (uint32_t)(HasDst ? 4 : 3);  // opc+dst?+fn+nargs  [6.2: was 7/6]
+			uint32_t Hdr = IsPair ? 5u : (HasDst ? 4u : 3u);  // opc + dst(s) + fn + nargs
 			if (IP + Hdr > BC.size()) return fail(IP, "OP_CALL header truncated");
 			uint32_t Off = IP + 1;
-			if (HasDst) {
+			if (IsPair) {
+				if (!chk(IP, "preg", decIdx(BC[Off++]), E.NPR)) return false;
+				if (!chk(IP, "vreg64", decIdx(BC[Off++]), E.NVR64)) return false;
+			} else if (HasDst) {
 				unsigned DstIdx = decIdx(BC[Off++]);
 				switch (DstKind) {
 				case 1: if (!chk(IP, "vreg", DstIdx, E.NVR))    return false; break;
@@ -103,17 +108,24 @@ namespace llvm {
 				}
 			}
 			uint8_t  FnIdx = BC[Off + 0];
-			uint8_t  NArgs = BC[Off + 1];
+			uint8_t  NArgsRaw = BC[Off + 1];
+			const bool Ind = (NArgsRaw & 0x80) != 0;
+			uint8_t  NArgs = (uint8_t)(NArgsRaw & 0x7F);
 			// no flags/ArgTypes bytes.
 			if (FnIdx >= E.CalleeTab.size())
 				return fail(IP, Twine("OP_CALL fn index out of range: ") + Twine((unsigned)FnIdx));
 			if (NArgs > 16)
 				return fail(IP, Twine("OP_CALL nargs too large: ") + Twine((unsigned)NArgs));
-			
-			uint32_t Total = Hdr + (uint32_t)NArgs;
+
+			uint32_t Extra = Ind ? 1u : 0u;
+			uint32_t Total = Hdr + Extra + (uint32_t)NArgs;
 			if (IP + Total > BC.size())
 				return fail(IP, "OP_CALL args truncated");
 			uint32_t ArgBase = IP + Hdr;
+			if (Ind) {
+				if (!chk(IP, "preg", decIdx(BC[ArgBase]), E.NPR)) return false;
+				ArgBase += 1;
+			}
 			for (unsigned i = 0; i < NArgs; ++i) {
 				unsigned Idx = decIdx(BC[ArgBase + i]);
 				// arg register file is determined by FTy at runtime;
@@ -127,11 +139,13 @@ namespace llvm {
 			(void)Total;  // suppress unused-warning
 			};
 		// Compute Total for IP advancement (same formula as inside verifyCall)
-		auto callTotal = [&](uint32_t IP, bool HasDst) -> uint32_t {
-			uint32_t Hdr = HasDst ? 4u : 3u;  // 6.2: was 7/6
-			uint32_t Off = IP + 1 + (HasDst ? 1u : 0u);
-			uint8_t  NArgs = BC[Off + 1];
-			return Hdr + (uint32_t)NArgs;
+		// NumDst: 0=void, 1=single dst, 2=pair
+		auto callTotal = [&](uint32_t IP, unsigned NumDst) -> uint32_t {
+			uint32_t Hdr = 3u + NumDst;  // opc + dst*NumDst + fn + nargs
+			uint32_t Off = IP + 1 + NumDst;
+			uint8_t  NArgsRaw = BC[Off + 1];
+			uint32_t Extra = (NArgsRaw & 0x80) ? 1u : 0u;
+			return Hdr + Extra + (uint32_t)(NArgsRaw & 0x7F);
 			};
 
 
@@ -214,6 +228,13 @@ namespace llvm {
 				if (!chk(IP, "vreg", decIdx(BC[IP + 1]), E.NVR)) return false;
 				if (!chk(IP, "vreg64", decIdx(BC[IP + 2]), E.NVR64)) return false;
 				if (!chk(IP, "vreg64", decIdx(BC[IP + 3]), E.NVR64)) return false;
+				IP += 5; break;
+			}
+			case OP_ICMP_PTR: {
+				if (IP + 5 > BC.size()) return fail(IP, "OP_ICMP_PTR truncated");
+				if (!chk(IP, "vreg", decIdx(BC[IP + 1]), E.NVR)) return false;
+				if (!chk(IP, "preg", decIdx(BC[IP + 2]), E.NPR)) return false;
+				if (!chk(IP, "preg", decIdx(BC[IP + 3]), E.NPR)) return false;
 				IP += 5; break;
 			}
 			case OP_CAST: {
@@ -357,23 +378,27 @@ namespace llvm {
 			}
 			case OP_CALL_VOID: {
 				if (!verifyCall(IP, 0)) return false;
-				IP += callTotal(IP, false); break;
+				IP += callTotal(IP, 0); break;
 			}
 			case OP_CALL_INT: {
 				if (!verifyCall(IP, 1)) return false;
-				IP += callTotal(IP, true); break;
+				IP += callTotal(IP, 1); break;
 			}
 			case OP_CALL_PTR: {
 				if (!verifyCall(IP, 2)) return false;
-				IP += callTotal(IP, true); break;
+				IP += callTotal(IP, 1); break;
 			}
 			case OP_CALL_INT64: {  
 				if (!verifyCall(IP, 3)) return false;
-				IP += callTotal(IP, true); break;
+				IP += callTotal(IP, 1); break;
 			}
 			case OP_CALL_F: {      
 				if (!verifyCall(IP, 4)) return false;
-				IP += callTotal(IP, true); break;
+				IP += callTotal(IP, 1); break;
+			}
+			case OP_CALL_PAIR: {
+				if (!verifyCall(IP, 5)) return false;
+				IP += callTotal(IP, 2); break;
 			}
 			case OP_SELECT: {
 				if (IP + 6 > BC.size()) return fail(IP, "OP_SELECT truncated");

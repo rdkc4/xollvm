@@ -252,10 +252,11 @@ After bytecode emission, `VMImpl::run()` calls these builders in order:
 
 ## ISA reference
 
-The ISA has **56 logical opcodes** (`OP_COUNT = 0x38`), variable-width encoding,
+The ISA has **58 logical opcodes** (`OP_COUNT = 0x3A`), variable-width encoding,
 and little-endian multi-byte immediates. (Recent additions: `OP_LOADI64` = 0x33
-used by `constInStream`, and four fusion opcodes emitted by `superOps` —
-`OP_MULADD` = 0x34, `OP_SHLADD` = 0x35, `OP_CMPSEL` = 0x36, `OP_ANDCMPZ` = 0x37.)
+used by `constInStream`, four fusion opcodes from `superOps` —
+`OP_MULADD`/`OP_SHLADD`/`OP_CMPSEL`/`OP_ANDCMPZ`, plus `OP_ICMP_PTR` = 0x38
+and `OP_CALL_PAIR` = 0x39 for pointer compares and `{ptr,i64}` returns.)
 
 Physical opcode bytes in the bytecode stream are **not** the logical VMOp values — they are
 passed through a per-function permutation (see [Opcode permutation](#opcode-permutation)).
@@ -267,16 +268,17 @@ passed through a per-function permutation (see [Opcode permutation](#opcode-perm
 |---|---|---|---|
 | `OP_LOADI` | 0x00 | `opc dst:u8 imm:i32le` (6 B) | Load 32-bit immediate into vreg. |
 | `OP_MOVR` | 0x01 | `opc dst:u8 src:u8` (3 B) | Copy vreg to vreg. |
-| `OP_BINOP` | 0x02 | `opc dst:u8 a:u8 b:u8 subop:u8` (5 B) | Binary integer op on vregs. See BinSubop table. |
+| `OP_BINOP` | 0x02 | `opc dst:u8 a:u8 b:u8 subop:u8` (5 B) | Binary integer op on vregs (all integer `BW≤32`, incl. i1/i8/i16). See BinSubop table. |
 | `OP_ICMP` | 0x03 | `opc dst:u8 a:u8 b:u8 pred:u8` (5 B) | Integer compare; result (0/1) into vreg. |
-| `OP_CAST` | 0x04 | `opc dst:u8 src:u8 kind:u8` (4 B) | Integer widening/narrowing within the i32 file. See CastKind table. |
+| `OP_ICMP_PTR` | 0x38 | `opc dst:u8 a:u8 b:u8 pred:u8` (5 B) | Pointer compare (`eq`/`ne`); preg×preg → vreg 0/1. |
+| `OP_CAST` | 0x04 | `opc dst:u8 src:u8 kind:u8` (4 B) | Integer widening/narrowing within the i32 file (incl. `zext i1→i8`). See CastKind table. |
 | `OP_PTRTOINT` | 0x05 | `opc dst:u8 srcp:u8` (3 B) | `ptrtoint` preg → vreg (i32). |
 | `OP_INTTOPTR` | 0x06 | `opc dstp:u8 src:u8` (3 B) | `inttoptr` vreg → preg. |
 | `OP_LOAD32` | 0x07 | `opc dst:u8 ptrreg:u8` (3 B) | Load i32 from address in preg. |
 | `OP_STORE32` | 0x08 | `opc val:u8 ptrreg:u8` (3 B) | Store i32 to address in preg. |
 | `OP_GEP` | 0x09 | `opc dstp:u8 basep:u8 idx:u8 elemsz:u16le` (6 B) | GEP: `basep + idx * elemsz` → preg. |
-| `OP_LOAD8` | 0x1B | `opc dst:u8 ptrreg:u8` (3 B) | Load i8 (zero-extend to i32). |
-| `OP_STORE8` | 0x1C | `opc val:u8 ptrreg:u8` (3 B) | Truncate vreg to i8, store. |
+| `OP_LOAD8` | 0x1B | `opc dst:u8 ptrreg:u8` (3 B) | Load i8 (zero-extend to i32). `load i1` is this plus `CK_TRUNC1` on the same slot. |
+| `OP_STORE8` | 0x1C | `opc val:u8 ptrreg:u8` (3 B) | Truncate vreg to i8, store. Also used for `store i1` (1-byte). |
 | `OP_LOAD16` | 0x1D | `opc dst:u8 ptrreg:u8` (3 B) | Load i16 (zero-extend to i32). |
 | `OP_STORE16` | 0x1E | `opc val:u8 ptrreg:u8` (3 B) | Truncate vreg to i16, store. |
 | `OP_LOADPTR` | 0x1F | `opc dstp:u8 ptrreg:u8` (3 B) | Load pointer from address in preg. |
@@ -361,14 +363,16 @@ opc  [dst_reg:u8]  fn:u8  nargs:u8  flags:u8  argtypes:u16le  [arg:u8 × nargs]
 - `argtypes` — 2 bits per argument (packed little-endian): `CAT_VREG=0`, `CAT_PREG=1`,
   `CAT_VREG64=2`, `CAT_FREG=3`.
 - Each `arg:u8` — register slot index in the corresponding register file.
+- Bit 7 of `nargs` marks an indirect call. The real argument count is `nargs & 0x7F`, and the next byte is the preg holding the callee pointer. `fn` still selects the `FunctionType`; the callee-table slot itself is null. Direct calls leave bit 7 clear and have no extra byte.
 
 | Logical opcode | Value | Return |
 |---|---|---|
 | `OP_CALL_VOID` | 0x0F | void |
-| `OP_CALL_INT` | 0x10 | i1/i8/i16/i32 → vreg `dst` (narrow returns zext'd into the i32 file) |
+| `OP_CALL_INT` | 0x10 | i1/i8/i16/i32 → vreg `dst` (narrow returns zext'd into the i32 file; `call i1` included) |
 | `OP_CALL_PTR` | 0x11 | ptr → preg `dstp` |
 | `OP_CALL_INT64` | 0x2A | i64 → vreg64 `dst64` |
 | `OP_CALL_F` | 0x2B | f64 → freg `dstf` |
+| `OP_CALL_PAIR` | 0x39 | exact `{ptr,i64}` → preg `dstp` + vreg64 `dst64`; `extractvalue` aliases those slots |
 
 </details>
 
@@ -411,12 +415,12 @@ is rounded back to f32 precision via fptrunc→fpext before being stored).
 
 | Value | Operation |
 |---|---|
-| 0 | `CK_ZEXT1` — zero-extend i1 → i32 |
-| 1 | `CK_ZEXT8` — zero-extend i8 → i32 |
+| 0 | `CK_ZEXT1` — zero-extend i1 → i32 (also `zext i1→i8`/`i16`; dest width is the slot type) |
+| 1 | `CK_ZEXT8` — zero-extend i8 → i32 (also `zext i8→i16`) |
 | 2 | `CK_ZEXT16` — zero-extend i16 → i32 |
 | 3 | `CK_SEXT8` — sign-extend i8 → i32 |
 | 4 | `CK_SEXT16` — sign-extend i16 → i32 |
-| 5 | `CK_TRUNC1` — truncate i32 → i1 |
+| 5 | `CK_TRUNC1` — truncate i32 → i1 (covers `trunc i8/i16/i32 → i1`) |
 | 6 | `CK_TRUNC8` — truncate i32 → i8 |
 | 7 | `CK_TRUNC16` — truncate i32 → i16 |
 

@@ -40,6 +40,7 @@
 #include "llvm/Transforms/Obfuscator/VMPass_ISA.h"
 
 #include <cstring>
+#include <utility>
 
 namespace llvm {
 
@@ -65,9 +66,17 @@ namespace llvm {
 		DenseMap<Value*, uint8_t>        VR64;       // i64  SSA value  → vreg64 slot
 		DenseMap<Value*, uint8_t>        PR;         // ptr  SSA value  → preg   slot
 		DenseMap<Value*, uint8_t>        FR;         // f64  SSA value  → freg   slot [Step 01.1]
+		// OP_CALL_PAIR: CallInst → {preg, vreg64}; extractvalue aliases these slots.
+		DenseMap<Value*, std::pair<uint8_t, uint8_t>> PairSlots;
 		SmallVector<Value*, 8>           CalleeTab;  // callee table (CALL* targets)
 		// 6.2: parallel FunctionType table -- one entry per CalleeTab slot.
 		SmallVector<FunctionType*, 8>    CalleeFTyTab;
+		// Indirect calls: one null placeholder per FunctionType. The runtime
+		// callee is a preg (nargs bit 7); the slot exists only so GVFTyIndices
+		// has a type. Never store the instruction itself — stripBody() frees it
+		// before the callee global is emitted.
+		DenseMap<FunctionType*, uint8_t> IndFTySlot;
+		DenseSet<unsigned>               IndSlots;
 
 		/// Metadata for an entry-block alloca created by PHI demotion.
 		struct PhiAllocaDesc {
@@ -396,7 +405,10 @@ namespace llvm {
 		}
 
 		uint8_t callee(Value* C) {
-			for (unsigned I = 0; I < CalleeTab.size(); ++I) if (CalleeTab[I] == C) return (uint8_t)I;
+			for (unsigned I = 0; I < CalleeTab.size(); ++I) {
+				if (IndSlots.count(I)) continue;
+				if (CalleeTab[I] == C) return (uint8_t)I;
+			}
 			assert(CalleeTab.size() < 252); CalleeTab.push_back(C);
 			return (uint8_t)(CalleeTab.size() - 1);
 		}
@@ -406,9 +418,27 @@ namespace llvm {
 			// Vararg callees are never deduplicated: each call site has a
 			// unique concrete FTy (arg count may differ between call sites).
 			if (!FTy->isVarArg())
-				for (unsigned I = 0; I < CalleeTab.size(); ++I) if (CalleeTab[I] == C) return (uint8_t)I;
+				for (unsigned I = 0; I < CalleeTab.size(); ++I) {
+					if (IndSlots.count(I)) continue;
+					if (CalleeTab[I] == C) return (uint8_t)I;
+				}
 			assert(CalleeTab.size() < 252); CalleeTab.push_back(C); CalleeFTyTab.push_back(FTy);
 			return (uint8_t)(CalleeTab.size() - 1);
+		}
+
+		// Null placeholder keyed by FunctionType. Bit 7 of nargs tells the
+		// handler to call a preg instead of this slot.
+		uint8_t indirectCalleeSlot(FunctionType* FTy) {
+			auto It = IndFTySlot.find(FTy);
+			if (It != IndFTySlot.end()) return It->second;
+			assert(CalleeTab.size() < 252);
+			uint8_t I = (uint8_t)CalleeTab.size();
+			auto* PTy = PointerType::getUnqual(FTy->getContext());
+			CalleeTab.push_back(ConstantPointerNull::get(PTy));
+			CalleeFTyTab.push_back(FTy);
+			IndFTySlot[FTy] = I;
+			IndSlots.insert(I);
+			return I;
 		}
 
 		// ── Bytecode emission primitives ──────────────────────────────────────

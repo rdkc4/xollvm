@@ -378,6 +378,25 @@ void VMImpl::buildHandlersIntArith() {
 		}
 	}
 
+	//  OP_ICMP_PTR -- [dst:u8 a:u8 b:u8 pred:u8]  preg×preg → vreg 0/1 (eq/ne)
+	{
+		auto B = mkOpc(OP_ICMP_PTR, "icmp_ptr");
+		Value* IP = advIP(B, 4);
+		Value* Dst = rdVR(B, IP, 0, "vm.icp.d");
+		Value* AIdx = rdPR(B, IP, 1, "vm.icp.a");
+		Value* BIdx = rdPR(B, IP, 2, "vm.icp.b");
+		Value* Pred = rdByte(B, IP, 3, "vm.icp.p");
+		Value* AV = ldPR(B, AIdx), * BV = ldPR(B, BIdx);
+		using P = CmpInst::Predicate;
+		Value* Eq = B.CreateICmpEQ(AV, BV, "vm.icp.eq");
+		Value* Ne = B.CreateICmpNE(AV, BV, "vm.icp.ne");
+		Value* R = B.CreateSelect(
+			B.CreateICmpEQ(Pred, B.getInt32(IsaEnc.encIcmpPred((uint8_t)P::ICMP_EQ))),
+			Eq, Ne, "vm.icp.r");
+		stVR(B, Dst, B.CreateZExt(R, I32Ty, "vm.icp.z"));
+		nextInsn(B);
+	}
+
 
 	//  OP_CAST -- [dst:u8 src:u8 kind:u8] 
 	{
@@ -1214,6 +1233,7 @@ void VMImpl::buildHandlersCall() {
 	buildCall2(OP_CALL_PTR, "call_ptr", RK2_PTR);
 	buildCall2(OP_CALL_INT64, "call_int64", RK2_I64);
 	buildCall2(OP_CALL_F, "call_f", RK2_F64);
+	buildCall2(OP_CALL_PAIR, "call_pair", RK2_PAIR);
 }
 
 void VMImpl::buildCall2(VMOp Opc, const Twine& Name, llvm::VMEngine::RetKind2 RK) {
@@ -1222,10 +1242,16 @@ void VMImpl::buildCall2(VMOp Opc, const Twine& Name, llvm::VMEngine::RetKind2 RK
 	auto* CurIP = B.CreateLoad(I32Ty, VMIP, "vm.cl.ip"); CurIP->setVolatile(true);
 
 	const bool IsVoid = (RK == RK2_VOID);
-	const unsigned Base = IsVoid ? 0u : 1u;
+	const bool IsPair = (RK == RK2_PAIR);
+	// PAIR encoding: opc dstp dst64 fn nargs [args...] — Base=2 dst bytes.
+	const unsigned Base = IsVoid ? 0u : (IsPair ? 2u : 1u);
 
 	Value* DstSlot = nullptr;
-	if (!IsVoid) {
+	Value* DstSlot64 = nullptr;
+	if (IsPair) {
+		DstSlot = deobf(B, loadBC(B, CurIP, 0, "vm.cl.drp"), MaskPR, "vm.cl.dsp");
+		DstSlot64 = deobf(B, loadBC(B, CurIP, 1, "vm.cl.dr64"), MaskVR64, "vm.cl.ds64");
+	} else if (!IsVoid) {
 		Value* DR = loadBC(B, CurIP, 0, "vm.cl.dr");
 		Value* DMask = (RK == RK2_PTR) ? MaskPR
 			: (RK == RK2_I64) ? MaskVR64
@@ -1233,27 +1259,46 @@ void VMImpl::buildCall2(VMOp Opc, const Twine& Name, llvm::VMEngine::RetKind2 RK
 		DstSlot = deobf(B, DR, DMask, "vm.cl.ds");
 	}
 
-	// fn(Base+0), nargs(Base+1), flags(Base+2), types_lo(Base+3), types_hi(Base+4)
+	// fn(Base+0), nargs(Base+1). Bit 7 of nargs: callee is a preg, and the
+	// byte at Base+2 is that preg. Real nargs is the low 7 bits. fn still
+	// selects the FunctionType; the table slot for an indirect call is null.
 	Value* FnIdx = B.CreateZExt(loadBC(B, CurIP, Base + 0, "vm.cl.fi"), I32Ty, "vm.cl.fx");
-	Value* NArgs = B.CreateZExt(loadBC(B, CurIP, Base + 1, "vm.cl.na"), I32Ty, "vm.cl.nx");
-	// fn(Base+0), nargs(Base+1) -- flags/types removed, now in GVFTyIndices.
+	Value* NArgsRaw = B.CreateZExt(loadBC(B, CurIP, Base + 1, "vm.cl.na"), I32Ty, "vm.cl.nr");
+	Value* IsInd = B.CreateICmpNE(B.CreateAnd(NArgsRaw, B.getInt32(0x80)), B.getInt32(0), "vm.cl.ind");
+	Value* NArgs = B.CreateAnd(NArgsRaw, B.getInt32(0x7F), "vm.cl.nx");
 
 
-	Value* Callee = ConstantPointerNull::get(cast<PointerType>(PtrTy));
+	Value* TblCallee = ConstantPointerNull::get(cast<PointerType>(PtrTy));
 	if (EffCallees) {
 		Value* FnIdx64 = B.CreateZExt(FnIdx, I64Ty, "vm.cl.fi64");
-		Callee = B.CreateLoad(PtrTy,
+		TblCallee = B.CreateLoad(PtrTy,
 			B.CreateGEP(PtrTy, EffCallees, FnIdx64, "vm.cl.cg"),
 			"vm.cl.fn");
 
-		// XOR-decode callee pointer when mask is active
+		// XOR-decode callee pointer when mask is active. Indirect pregs are
+		// the real pointer and must not be decoded.
 		if (EffCalleeMask) {
-			Value* CalInt = B.CreatePtrToInt(Callee, I64Ty, "vm.cl.ci");
+			Value* CalInt = B.CreatePtrToInt(TblCallee, I64Ty, "vm.cl.ci");
 			Value* Decoded = B.CreateXor(CalInt, EffCalleeMask, "vm.cl.dec");
-			Callee = B.CreateIntToPtr(Decoded, PtrTy, "vm.cl.dp");
+			TblCallee = B.CreateIntToPtr(Decoded, PtrTy, "vm.cl.dp");
 		}
 
 	}
+
+	auto* IndBB = BasicBlock::Create(Ctx, "vm.cl.ind", HFn);
+	auto* DirBB = BasicBlock::Create(Ctx, "vm.cl.dir", HFn);
+	auto* CalMerge = BasicBlock::Create(Ctx, "vm.cl.cm", HFn);
+	B.CreateCondBr(IsInd, IndBB, DirBB);
+	IRBuilder<> IB(IndBB);
+	Value* IndSlot = deobf(IB, loadBC(IB, CurIP, Base + 2, "vm.cl.ib"), MaskPR, "vm.cl.isp");
+	Value* IndCallee = ldPR(IB, IndSlot);
+	IB.CreateBr(CalMerge);
+	IRBuilder<> DB(DirBB);
+	DB.CreateBr(CalMerge);
+	B.SetInsertPoint(CalMerge);
+	auto* Callee = PHINode::Create(PtrTy, 2, "vm.cl.callee", CalMerge);
+	Callee->addIncoming(IndCallee, IndBB);
+	Callee->addIncoming(TblCallee, DirBB);
 
 
 	// Load FTyIdx from GVFTyIndices[FnIdx].
@@ -1266,12 +1311,13 @@ void VMImpl::buildCall2(VMOp Opc, const Twine& Name, llvm::VMEngine::RetKind2 RK
 		FTyIdx = B.CreateZExt(FTyIdxByte, I32Ty, "vm.cl.ftyx");
 	}
 
-	// Pre-load all MaxArgs arg slots.  The per-FTy case BBs select the right
-	// register file for each argument statically (no runtime Cat switch needed).
+	// Pre-load all MaxArgs arg slots. Direct args start at Base+2; indirect
+	// args start at Base+3 (Base+2 is the callee preg).
+	Value* ArgBase = B.CreateAdd(B.getInt32(Base + 2),
+		B.CreateZExt(IsInd, I32Ty, "vm.cl.indz"), "vm.cl.ab0");
 	SmallVector<Value*, MaxArgs> PVals, IVals, I64Vs, FregVals;
 	for (unsigned i = 0; i < MaxArgs; ++i) {
-		// arg bytes now start at Base+2 (was Base+5).
-		Value* AB = loadBC(B, CurIP, Base + 2 + i, "vm.cl.ab");
+		Value* AB = loadBCDyn(B, CurIP, B.CreateAdd(ArgBase, B.getInt32(i), "vm.cl.ao"), "vm.cl.ab");
 		Value* PIdx = deobf(B, AB, MaskPR, "vm.cl.pi");
 		Value* VIdx = deobf(B, AB, MaskVR, "vm.cl.vi");
 		Value* V64I = deobf(B, AB, MaskVR64, "vm.cl.v64i");
@@ -1284,19 +1330,19 @@ void VMImpl::buildCall2(VMOp Opc, const Twine& Name, llvm::VMEngine::RetKind2 RK
 		FregVals.push_back(ldFR(B, FIdx));
 	}
 
-
-
-
-
-	// Advance IP: Base + 2 header bytes + nargs arg bytes  (was Base + 5).
-	Value* Adv = B.CreateAdd(B.getInt32(Base + 2), NArgs, "vm.cl.adv");
+	// Advance IP: Base + 2 header bytes + optional indirect byte + nargs.
+	Value* Adv = B.CreateAdd(
+		B.CreateAdd(B.getInt32(Base + 2), NArgs, "vm.cl.adv0"),
+		B.CreateZExt(IsInd, I32Ty, "vm.cl.indz2"), "vm.cl.adv");
 	B.CreateStore(B.CreateAdd(CurIP, Adv, "vm.cl.nb"), VMIP)->setVolatile(true);
 
 
+	Type* PairTy = StructType::get(Ctx, { PtrTy, I64Ty });
 	Type* RetTy = (RK == RK2_PTR) ? (Type*)PtrTy
 		: (RK == RK2_I64) ? (Type*)I64Ty
 		: (RK == RK2_F64) ? (Type*)DoubleTy
 		: (RK == RK2_I32) ? (Type*)I32Ty
+		: (RK == RK2_PAIR) ? (Type*)PairTy
 		: (Type*)Type::getVoidTy(Ctx);
 
 	BasicBlock* MergeBB = BasicBlock::Create(Ctx, "vm.cl.merge", HFn);
@@ -1387,7 +1433,12 @@ void VMImpl::buildCall2(VMOp Opc, const Twine& Name, llvm::VMEngine::RetKind2 RK
 	}
 
 	IRBuilder<> MB(MergeBB);
-	if (!IsVoid && DstSlot && RetPHI) {
+	if (IsPair && DstSlot && DstSlot64 && RetPHI) {
+		Value* RP = MB.CreateExtractValue(RetPHI, { 0 }, "vm.cl.pair.p");
+		Value* R64 = MB.CreateExtractValue(RetPHI, { 1 }, "vm.cl.pair.i64");
+		stPR(MB, DstSlot, RP);
+		stVR64(MB, DstSlot64, R64);
+	} else if (!IsVoid && DstSlot && RetPHI) {
 		switch (RK) {
 		case RK2_PTR: stPR(MB, DstSlot, RetPHI);  break;
 		case RK2_I64: stVR64(MB, DstSlot, RetPHI); break;

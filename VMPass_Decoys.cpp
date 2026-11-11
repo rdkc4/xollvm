@@ -67,7 +67,7 @@ unsigned VMImpl::computeNumDecoys() const {
 	}
 
 	switch (Cfg.handlerDecoys) {
-		case 1:  return 14;          // ~25% of OP_COUNT (0x38 == 56)
+		case 1:  return 14;          // ~25% of OP_COUNT (0x3A == 58)
 		case 2:  return 28;          // ~50%
 		case 3:  return kMaxDecoys;  // 32, hard cap
 		default: return 0;           // off (byte-identical)
@@ -201,7 +201,7 @@ void VMImpl::wireLiveDecoys(Function* EF) {
 	// range-scanning. CALL sub-blocks (switch/case/merge/unreachable) are
 	// all caught below by the "vm.cl." name-prefix filter instead.
 	static const VMOp kCallOps[] = {
-		OP_CALL_VOID, OP_CALL_INT, OP_CALL_PTR, OP_CALL_INT64, OP_CALL_F
+		OP_CALL_VOID, OP_CALL_INT, OP_CALL_PTR, OP_CALL_INT64, OP_CALL_F, OP_CALL_PAIR
 	};
 	SmallPtrSet<const BasicBlock*, 16> CallHeadSet;
 	for (VMOp Op : kCallOps)

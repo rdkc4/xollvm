@@ -1,0 +1,41 @@
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+static __attribute__((noinline)) _Bool is_odd(uint32_t x) {{
+    return (x & 1u) != 0u;
+}}
+
+static __attribute__((noinline)) uint8_t mix8(uint32_t x, _Bool flag) {{
+    uint8_t n = (uint8_t)(x ^ 0x5Au);
+    return flag ? (uint8_t)(n + 1u) : n;
+}}
+
+static __attribute__((noinline)) uint16_t mix16(uint32_t x, uint8_t n) {{
+    return (uint16_t)((x * 3u) ^ (uint32_t)n);
+}}
+
+__attribute__((noinline, annotate("{annotation}")))
+uint32_t obf_target(uint32_t x, uint32_t y) {{
+    _Bool a = is_odd(x);
+    _Bool b = is_odd(y);
+    uint8_t n8 = mix8(x, a);
+    uint8_t m8 = mix8(y, b);
+    uint16_t n16 = mix16(x, n8);
+    uint16_t m16 = mix16(y, m8);
+    uint8_t t8 = (uint8_t)(n16 ^ m16);
+    _Bool low = (_Bool)(t8 & 1u);
+    uint32_t r = (uint32_t)a + ((uint32_t)b << 1) + (uint32_t)n8 + (uint32_t)m8;
+    r ^= (uint32_t)n16;
+    r += (uint32_t)m16;
+    if (low) r ^= 0x100u;
+    return r;
+}}
+
+int main(int argc, char** argv) {{
+    uint32_t x = (argc > 1) ? (uint32_t)strtoul(argv[1], 0, 0) : 123u;
+    uint32_t y = (argc > 2) ? (uint32_t)strtoul(argv[2], 0, 0) : 456u;
+    uint32_t r = obf_target(x, y);
+    printf("R=%u\n", r);
+    return (int)(r & 0xFFu);
+}}

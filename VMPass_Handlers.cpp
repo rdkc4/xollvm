@@ -1348,10 +1348,26 @@ void VMImpl::buildCall2(VMOp Opc, const Twine& Name, llvm::VMEngine::RetKind2 RK
 
 		}
 
-
-		auto* CallFTy = FunctionType::get(RetTy, ATys, isVA);
+		// Prefer the concrete SrcFTy return when it is a narrow integer so the
+		// call uses the real ABI width; then zext into the i32 RetPHI / vreg.
+		// (Shared FTy table mixes return kinds across CALL_* opcodes - only
+		// override when SrcFTy's return is a <=32-bit int under RK2_I32.)
+		Type* CallRetTy = RetTy;
+		if (RK == RK2_I32) {
+			Type* SRT = SrcFTy->getReturnType();
+			if (SRT->isIntegerTy() && SRT->getIntegerBitWidth() <= 32) {
+				CallRetTy = SRT;
+			}
+		}
+		auto* CallFTy = FunctionType::get(CallRetTy, ATys, isVA);
 		auto* CI = CB.CreateCall(CallFTy, Callee, CA, IsVoid ? "" : "vm.cl.rv");
-		if (!IsVoid && RetPHI) RetPHI->addIncoming(CI, CB.GetInsertBlock());
+		if (!IsVoid && RetPHI) {
+			Value* RetV = CI;
+			if (CallRetTy != RetTy) {
+				RetV = CB.CreateZExt(CI, RetTy, "vm.cl.rz");
+			}
+			RetPHI->addIncoming(RetV, CB.GetInsertBlock());
+		}
 		CB.CreateBr(MergeBB);
 	}
 

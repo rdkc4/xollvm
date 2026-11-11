@@ -6,6 +6,7 @@ from ._common import (
     Registry, ann_extra,
     render_vm_v7_call_i64_args_program,
     render_vm_v7_call_i64_ret_program,
+    render_vm_v7_call_narrow_program,
     render_vm_v7_call_program,
     render_vm_v7_call_vararg_program,
     render_vm_v7_casts_program,
@@ -242,6 +243,11 @@ def register(reg: Registry, **_opts) -> None:
             gates=VM_CORE_GATES + ["vm_enc_ctor", "vm_callees_global"],
             category="vm",
             src_override=render_vm_v7_call_i64_ret_program(vm_v7))
+    reg.add(name="rt_vm_v7_call_narrow", passes=["vm"],
+            ann_override=vm_v7,
+            gates=VM_CORE_GATES + ["vm_enc_ctor", "vm_callees_global"],
+            extra_opts=_DBG, category="vm",
+            src_override=render_vm_v7_call_narrow_program(vm_v7))
 
     # ── Shared-engine architecture tests (Step 06) ──
     reg.add(name="rt_vm_v7_multi_function", passes=["vm"],

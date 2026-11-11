@@ -365,7 +365,7 @@ opc  [dst_reg:u8]  fn:u8  nargs:u8  flags:u8  argtypes:u16le  [arg:u8 × nargs]
 | Logical opcode | Value | Return |
 |---|---|---|
 | `OP_CALL_VOID` | 0x0F | void |
-| `OP_CALL_INT` | 0x10 | i32 → vreg `dst` |
+| `OP_CALL_INT` | 0x10 | i1/i8/i16/i32 → vreg `dst` (narrow returns zext'd into the i32 file) |
 | `OP_CALL_PTR` | 0x11 | ptr → preg `dstp` |
 | `OP_CALL_INT64` | 0x2A | i64 → vreg64 `dst64` |
 | `OP_CALL_F` | 0x2B | f64 → freg `dstf` |

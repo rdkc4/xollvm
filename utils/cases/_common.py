@@ -438,6 +438,10 @@ def render_vm_v7_call_i64_ret_program(annotation: str) -> str:
     return programs.render("vm.call_i64_ret", annotation=annotation)
 
 
+def render_vm_v7_call_narrow_program(annotation: str) -> str:
+    return programs.render("vm.call_narrow", annotation=annotation)
+
+
 def render_vm_v7_multi_function_program(annotation: str) -> str:
     return programs.render("vm.multi_function", annotation=annotation)
 

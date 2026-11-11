@@ -115,7 +115,11 @@ uint32_t BytecodeEmitter::isize(Instruction* I) {
 	if (Op == Instruction::Trunc) {
 		unsigned W = Ty->getIntegerBitWidth();
 		Type* STy = I->getOperand(0)->getType();
-		if (STy->isIntegerTy(32) && (W == 1 || W == 8 || W == 16)) return 4;
+		// Both ends live in the i32 vreg file (i1/i8/i16/i32). CK_TRUNC*
+		// is just an AND of the already-widened slot.
+		if (STy->isIntegerTy() && STy->getIntegerBitWidth() <= 32 &&
+			W < STy->getIntegerBitWidth() && (W == 1 || W == 8 || W == 16))
+			return 4;
 		if (STy->isIntegerTy(64) && (W == 1 || W == 8 || W == 16 || W == 32)) return 4;
 		markUnsupported(I); return 0;
 	}
@@ -255,7 +259,8 @@ uint32_t BytecodeEmitter::isize(Instruction* I) {
 		// Actually: fn(1) + nargs(1) + flags(1) + types_lo(1) + types_hi(1) + args(NA) = 5+NA
 		(void)Hdr;
 		if (Ty->isVoidTy())         return 6 + NA;  // opc + fn + nargs + flags + tylo + tyhi + args
-		if (Ty->isIntegerTy(32) || Ty->isPointerTy()) return 7 + NA;  // dst + above
+		// Narrow ints (i1/i8/i16) share OP_CALL_INT / the i32 vreg file with i32.
+		if ((Ty->isIntegerTy() && Ty->getIntegerBitWidth() <= 32) || Ty->isPointerTy()) return 7 + NA;  // dst + above
 		if (Ty->isIntegerTy(64))    return 7 + NA;  // OP_CALL_INT64
 		if (Ty->isFloatTy() || Ty->isDoubleTy()) return 7 + NA;  // OP_CALL_F
 		markUnsupported(I); return 0;
@@ -682,8 +687,10 @@ void BytecodeEmitter::emit(Instruction* I) {
 	if (Op == Instruction::Trunc) {
 		unsigned W = Ty->getIntegerBitWidth();
 		Type* STy = I->getOperand(0)->getType();
-		if (STy->isIntegerTy(32)) {
-			if (W != 1 && W != 8 && W != 16) { markUnsupported(I); return; }
+		if (STy->isIntegerTy() && STy->getIntegerBitWidth() <= 32) {
+			if (W >= STy->getIntegerBitWidth() || (W != 1 && W != 8 && W != 16)) {
+				markUnsupported(I); return;
+			}
 			CastKind K = (W == 1) ? CK_TRUNC1 : (W == 8) ? CK_TRUNC8 : CK_TRUNC16;
 			bop(OP_CAST); b8(xorSalt(newVR(I))); b8(xorSalt(vr(I->getOperand(0)))); b8(encCastKind((uint8_t)K)); return;
 		}
@@ -958,7 +965,7 @@ void BytecodeEmitter::emit(Instruction* I) {
 		if (Ty->isVoidTy()) {
 			bop(OP_CALL_VOID);
 		}
-		else if (Ty->isIntegerTy(32)) {
+		else if (Ty->isIntegerTy() && Ty->getIntegerBitWidth() <= 32) {
 			bop(OP_CALL_INT);   b8(xorSalt(newVR(I)));
 		}
 		else if (Ty->isPointerTy()) {

@@ -730,11 +730,25 @@ void VMImpl::ensureCallFTyCases() {
 				}
 			}
 
-			auto* CallFTy = FunctionType::get(RetTy, ATys, isVA);
+			// Match buildCall2: narrow int returns use the concrete ABI width,
+			// then zext into the i32 RetPHI / vreg (OP_CALL_INT).
+			Type* CallRetTy = RetTy;
+			if (RK == VMEngine::RK2_I32) {
+				Type* SRT = SrcFTy->getReturnType();
+				if (SRT->isIntegerTy() && SRT->getIntegerBitWidth() <= 32) {
+					CallRetTy = SRT;
+				}
+			}
+			auto* CallFTy = FunctionType::get(CallRetTy, ATys, isVA);
 			auto* CI = CB.CreateCall(CallFTy, CSW.Callee, CA,
 				IsVoid ? "" : "vm.cl.rv");
-			if (!IsVoid && CSW.RetPHI)
-				CSW.RetPHI->addIncoming(CI, CB.GetInsertBlock());
+			if (!IsVoid && CSW.RetPHI) {
+				Value* RetV = CI;
+				if (CallRetTy != RetTy) {
+					RetV = CB.CreateZExt(CI, RetTy, "vm.cl.rz");
+				}
+				CSW.RetPHI->addIncoming(RetV, CB.GetInsertBlock());
+			}
 			CB.CreateBr(CSW.MergeBB);
 		}
 	}

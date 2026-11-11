@@ -44,7 +44,7 @@ namespace llvm {
 		// Step 02: argtypes is now u16le (2 bits per arg: 00=vreg,01=preg,10=vreg64,11=freg)
 		//          nargs is followed by a flags byte: bit0 = isVarArg
 		OP_CALL_VOID = 0x0F,  // fn:u8 nargs:u8 flags:u8 types:u16le [arg:u8 * nargs]
-		OP_CALL_INT = 0x10,  // dst:u8 fn:u8 nargs:u8 flags:u8 types:u16le [arg:u8 * nargs]
+		OP_CALL_INT = 0x10,  // dst:u8 fn:u8 nargs:u8 flags:u8 types:u16le [arg:u8 * nargs]  i1/i8/i16/i32 → i32 vreg
 		OP_CALL_PTR = 0x11,  // dstp:u8 fn:u8 nargs:u8 flags:u8 types:u16le [arg:u8 * nargs]
 		OP_CALL_INT64 = 0x2A,  // dst64:u8 fn:u8 nargs:u8 flags:u8 types:u16le [arg:u8 * nargs]  [Step 02]
 		OP_CALL_F = 0x2B,  // dstf:u8 fn:u8 nargs:u8 flags:u8 types:u16le [arg:u8 * nargs]   [Step 02]

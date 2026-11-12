@@ -215,7 +215,10 @@ uint32_t BytecodeEmitter::isize(Instruction* I) {
 			VT->isPointerTy())
 			return 3;
 		if (VT->isDoubleTy()) return 3;        // OP_STORE_F  — 8-byte	
-		if (VT->isFloatTy())  return 3;        // OP_STORE_F32 — 4-byte  
+		if (VT->isFloatTy())  return 3;        // OP_STORE_F32 — 4-byte
+		// {ptr,i64} → STOREPTR + GEP + STORE64 when PairSlots tracks the value.
+		if (isPtrI64PairTy(VT) && PairSlots.count(SI->getValueOperand()))
+			return 12;
 		markUnsupported(I);
 		return 0;
 	}
@@ -285,7 +288,10 @@ uint32_t BytecodeEmitter::isize(Instruction* I) {
 			if (AT->isFloatTy() || AT->isDoubleTy()) continue;  // freg
 			markUnsupported(I); return 0;
 		}
-		if (NA > 16) { markUnsupported(I, "CALL arg count exceeds MaxArgs (16)"); return 0; }
+		if (NA > kVMCallMaxArgs) {
+			markUnsupported(I, "CALL arg count exceeds MaxArgs (32)");
+			return 0;
+		}
 		// Indirect: extra preg byte after nargs (bit 7 of nargs).
 		unsigned Ind = isa<Constant>(CI->getCalledOperand()) ? 0u : 1u;
 		// encoding: [dst?] fn:u8 nargs:u8 flags:u8 types:u16le [arg:u8 * nargs]
@@ -927,6 +933,34 @@ void BytecodeEmitter::emit(Instruction* I) {
 			VMOp StoreOp = VT->isFloatTy() ? OP_STORE_F32 : OP_STORE_F;
 			bop(StoreOp); b8(xorSalt(fr(SI->getValueOperand()))); b8(xorSalt(pr(SI->getPointerOperand()))); return;
 		}
+		// store {ptr,i64}: STOREPTR at base, GEP to field1, STORE64.
+		if (isPtrI64PairTy(VT)) {
+			auto PIt = PairSlots.find(SI->getValueOperand());
+			if (PIt == PairSlots.end()) {
+				markUnsupported(I, "store of untracked {ptr,i64}");
+				return;
+			}
+			if (NPR >= 250) {
+				markUnsupported(I, "preg file overflow (>250 slots)");
+				return;
+			}
+			auto* ST = cast<StructType>(VT);
+			uint64_t Off1 = DL->getStructLayout(ST)->getElementOffset(1);
+			if (Off1 > 0x7FFFFFFFull) {
+				markUnsupported(I, "store {ptr,i64} field offset out of range");
+				return;
+			}
+			Value* Base = SI->getPointerOperand();
+			uint8_t Preg = PIt->second.first;
+			uint8_t V64 = PIt->second.second;
+			uint8_t Scratch = NPR++;
+			auto* CIV = ConstantInt::get(Type::getInt32Ty(I->getContext()), Off1);
+			bop(OP_STOREPTR); b8(xorSalt(Preg)); b8(xorSalt(pr(Base)));
+			bop(OP_GEP); b8(xorSalt(Scratch)); b8(xorSalt(pr(Base)));
+			b8(xorSalt(vr(CIV))); b8(1); b8(0);
+			bop(OP_STORE64); b8(xorSalt(V64)); b8(xorSalt(Scratch));
+			return;
+		}
 
 		markUnsupported(I); return;
 	}
@@ -1033,7 +1067,7 @@ void BytecodeEmitter::emit(Instruction* I) {
 		// build a concrete FunctionType from the actual call args so that
 		// SrcFTy->getNumParams() covers all args (fixed + vararg) at dispatch.
 		// CI->getFunctionType() only has the fixed params (e.g. i32(i8*, ...)).
-		SmallVector<Type*, 16> ConcreteArgTys;
+		SmallVector<Type*, kVMCallMaxArgs> ConcreteArgTys;
 		for (unsigned A = 0; A < CI->arg_size(); ++A)
 			ConcreteArgTys.push_back(CI->getArgOperand(A)->getType());
 		FunctionType* ConcreteFTy = FunctionType::get(
@@ -1051,10 +1085,9 @@ void BytecodeEmitter::emit(Instruction* I) {
 		}
 		uint8_t FI = IndCall ? indirectCalleeSlot(ConcreteFTy) : callee(Fn, ConcreteFTy);
 		unsigned NAw = CI->arg_size();
-		if (NAw > 16) {
-			markUnsupported(I, "CALL arg count exceeds MaxArgs (16)");
+		if (NAw > kVMCallMaxArgs) {
+			markUnsupported(I, "CALL arg count exceeds MaxArgs (32)");
 			return;
-			
 		}
 		uint8_t NA = (uint8_t)NAw;
 

@@ -267,7 +267,11 @@ namespace llvm {
 	// CallArgType — 2-bit field encoding for CALL instruction argument types.
 	// In the current encoding, argument type info is carried per-callee in
 	// GVFTyIndices rather than inline in the bytecode, so the 8-argument
-	// bitfield limit no longer applies.  MaxArgs is now 16.
+	// bitfield limit no longer applies.  nargs low 7 bits allow ≤127; the
+	// CALL handler preloads kVMCallMaxArgs slots (raised 16→32 for fat
+	// Debug varargs).
+	static constexpr unsigned kVMCallMaxArgs = 32;
+
 	enum CallArgType : uint8_t {
 		CAT_VREG = 0,  // i32  — read from vm.regs
 		CAT_PREG = 1,  // ptr  — read from vm.pregs

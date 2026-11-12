@@ -242,7 +242,7 @@ namespace llvm {
 
 		// CALL handler types (hoisted from VMImpl for SharedState visibility)
 		enum RetKind2 { RK2_VOID = 0, RK2_I32 = 1, RK2_PTR = 2, RK2_I64 = 3, RK2_F64 = 4, RK2_PAIR = 5 };
-		static constexpr unsigned MaxArgs = 16;
+		static constexpr unsigned MaxArgs = kVMCallMaxArgs;
 		static constexpr unsigned NumRetKinds = 6;
 
 		// Module-level shared state for the vm_engine

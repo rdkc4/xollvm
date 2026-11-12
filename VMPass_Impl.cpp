@@ -50,14 +50,56 @@ bool VMImpl::run() {
 
 	//     Lower/strip intrinsics that clang emits at -O0 but the VM cannot
 	//      encode.  Three tiers:
-	//        A) Strip  — debug, lifetime, assume: zero runtime semantics.
-	//        B) Memory — memcpy/memmove/memset with constant size ≤ 8:
-	//                    replace with a single typed load+store or store.
+	//        A) Strip  — debug, lifetime, assume, freeze: zero/identity semantics.
+	//        B) Memory — memcpy/memset/memmove const size ≤ 64: chunked
+	//                    i64/i32/i16/i8 load+store (or store-of-fill). memmove
+	//                    uses an entry alloca temp then two forward copies.
 	//        C) Float  — fabs, fmuladd, fma, minnum, maxnum, copysign:
 	//                    expand to FNeg/FMul/FAdd/FCmp/Select the VM handles.
 	//        D) Int    — abs: expand to ICmp/Sub/Select.
 	//      Anything else stays and isize() will markUnsupported gracefully.
 	{
+		constexpr uint64_t kMemExpandMax = 64;
+
+		auto emitMemChunks = [&](IRBuilder<>& B, Value* Dst, Value* Src,
+			uint64_t Sz, uint8_t FillByte, bool IsSet) {
+			uint64_t Off = 0;
+			auto chunk = [&](Type* Ty, unsigned Bytes) {
+				while (Sz - Off >= Bytes) {
+					Value* DPtr = Off ? B.CreateGEP(I8Ty, Dst, B.getInt64(Off), "mc.dp")
+						: Dst;
+					if (IsSet) {
+						uint64_t Pat = 0;
+						for (unsigned i = 0; i < Bytes; ++i)
+							Pat |= ((uint64_t)FillByte << (i * 8));
+						B.CreateStore(ConstantInt::get(Ty, Pat), DPtr);
+					} else {
+						Value* SPtr = Off ? B.CreateGEP(I8Ty, Src, B.getInt64(Off), "mc.sp")
+							: Src;
+						B.CreateStore(B.CreateLoad(Ty, SPtr, "mc.ld"), DPtr);
+					}
+					Off += Bytes;
+				}
+			};
+			chunk(I64Ty, 8);
+			chunk(I32Ty, 4);
+			chunk(I16Ty, 2);
+			chunk(I8Ty, 1);
+		};
+
+		// Tier A: freeze → identity (covers freeze i32 and other legal SSA types).
+		{
+			SmallVector<FreezeInst*, 16> Freezes;
+			for (BasicBlock& BB : F)
+				for (Instruction& I : BB)
+					if (auto* FI = dyn_cast<FreezeInst>(&I))
+						Freezes.push_back(FI);
+			for (FreezeInst* FI : Freezes) {
+				FI->replaceAllUsesWith(FI->getOperand(0));
+				FI->eraseFromParent();
+			}
+		}
+
 		SmallVector<CallInst*, 32> Intrinsics;
 		for (BasicBlock& BB : F)
 			for (Instruction& I : BB)
@@ -82,40 +124,43 @@ bool VMImpl::run() {
 			default: break;
 			}
 
-			//  Tier B: memcpy / memmove 
+			//  Tier B: memcpy / memmove (≤64 chunked)
 			if (IID == Intrinsic::memcpy || IID == Intrinsic::memmove) {
 				if (auto* SzC = dyn_cast<ConstantInt>(CI->getArgOperand(2))) {
-					Type* ElemTy = nullptr;
-					switch (SzC->getZExtValue()) {
-					case 1: ElemTy = I8Ty;  break;
-					case 2: ElemTy = I16Ty; break;
-					case 4: ElemTy = I32Ty; break;
-					case 8: ElemTy = I64Ty; break;
-					default: break;
-					}
-					if (ElemTy) {
-						B.CreateStore(B.CreateLoad(ElemTy, CI->getArgOperand(1), "mc.ld"),
-							CI->getArgOperand(0));
+					uint64_t Sz = SzC->getZExtValue();
+					if (Sz > 0 && Sz <= kMemExpandMax) {
+						Value* Dst = CI->getArgOperand(0);
+						Value* Src = CI->getArgOperand(1);
+						if (IID == Intrinsic::memmove) {
+							// Overlap-safe: entry temp, then src→tmp→dst.
+							IRBuilder<> EB(&F.getEntryBlock(),
+								F.getEntryBlock().getFirstInsertionPt());
+							AllocaInst* Tmp = EB.CreateAlloca(
+								ArrayType::get(I8Ty, Sz), nullptr, "mm.tmp");
+							emitMemChunks(B, Tmp, Src, Sz, 0, /*IsSet=*/false);
+							emitMemChunks(B, Dst, Tmp, Sz, 0, /*IsSet=*/false);
+						} else {
+							emitMemChunks(B, Dst, Src, Sz, 0, /*IsSet=*/false);
+						}
 						CI->eraseFromParent();
 						continue;
 					}
 				}
-				continue; // non-constant / odd size → markUnsupported later
+				continue; // non-constant / too large → markUnsupported later
 			}
 
-			//  Tier B: memset ─
+			//  Tier B: memset (≤64 chunked)
 			if (IID == Intrinsic::memset) {
 				auto* SzC = dyn_cast<ConstantInt>(CI->getArgOperand(2));
 				auto* ValC = dyn_cast<ConstantInt>(CI->getArgOperand(1));
-				if (SzC && ValC && SzC->getZExtValue() <= 8) {
+				if (SzC && ValC) {
 					uint64_t Sz = SzC->getZExtValue();
-					uint8_t  Val = (uint8_t)ValC->getZExtValue();
-					uint64_t Fill = 0;
-					for (uint64_t i = 0; i < Sz; ++i) Fill |= ((uint64_t)Val << (i * 8));
-					Type* ElemTy = IntegerType::get(Ctx, (unsigned)(Sz * 8));
-					B.CreateStore(ConstantInt::get(ElemTy, Fill), CI->getArgOperand(0));
-					CI->eraseFromParent();
-					continue;
+					if (Sz > 0 && Sz <= kMemExpandMax) {
+						emitMemChunks(B, CI->getArgOperand(0), nullptr, Sz,
+							(uint8_t)ValC->getZExtValue(), /*IsSet=*/true);
+						CI->eraseFromParent();
+						continue;
+					}
 				}
 				continue;
 			}

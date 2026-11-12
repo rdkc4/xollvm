@@ -51,7 +51,7 @@ bool VMImpl::run() {
 	//     Lower/strip intrinsics that clang emits at -O0 but the VM cannot
 	//      encode.  Three tiers:
 	//        A) Strip  — debug, lifetime, assume, expect, freeze: zero/identity.
-	//        B) Memory — memcpy/memset/memmove const size ≤ 64: chunked
+	//        B) Memory — memcpy/memset/memmove const size ≤ 128: chunked
 	//                    i64/i32/i16/i8 load+store (or store-of-fill). memmove
 	//                    uses an entry alloca temp then two forward copies.
 	//        C) Float  — fabs, fmuladd, fma, minnum, maxnum, copysign:
@@ -59,7 +59,7 @@ bool VMImpl::run() {
 	//        D) Int    — abs: expand to ICmp/Sub/Select.
 	//      Anything else stays and isize() will markUnsupported gracefully.
 	{
-		constexpr uint64_t kMemExpandMax = 64;
+		constexpr uint64_t kMemExpandMax = 128;
 
 		auto emitMemChunks = [&](IRBuilder<>& B, Value* Dst, Value* Src,
 			uint64_t Sz, uint8_t FillByte, bool IsSet) {
@@ -128,7 +128,7 @@ bool VMImpl::run() {
 			default: break;
 			}
 
-			//  Tier B: memcpy / memmove (≤64 chunked)
+			//  Tier B: memcpy / memmove (≤128 chunked)
 			if (IID == Intrinsic::memcpy || IID == Intrinsic::memmove) {
 				if (auto* SzC = dyn_cast<ConstantInt>(CI->getArgOperand(2))) {
 					uint64_t Sz = SzC->getZExtValue();
@@ -153,7 +153,7 @@ bool VMImpl::run() {
 				continue; // non-constant / too large → markUnsupported later
 			}
 
-			//  Tier B: memset (≤64 chunked)
+			//  Tier B: memset (≤128 chunked)
 			if (IID == Intrinsic::memset) {
 				auto* SzC = dyn_cast<ConstantInt>(CI->getArgOperand(2));
 				auto* ValC = dyn_cast<ConstantInt>(CI->getArgOperand(1));

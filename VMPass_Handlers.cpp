@@ -1302,8 +1302,12 @@ void VMImpl::buildCall2(VMOp Opc, const Twine& Name, llvm::VMEngine::RetKind2 RK
 
 
 	// Load FTyIdx from GVFTyIndices[FnIdx].
+	// In shared-engine mode the switch starts empty and ensureCallFTyCases()
+	// adds cases later, so FTyIdx must always be the runtime load - otherwise
+	// an engine first populated by a call-less function bakes the selector to
+	// a constant 0 and every call dispatches to FTy case 0.
 	Value* FTyIdx = B.getInt32(0);
-	if (EffFTyIndices && !UniqueFTys.empty()) {
+	if (EffFTyIndices && (SharedEngineMode || !UniqueFTys.empty())) {
 		Value* FnIdx64b = B.CreateZExt(FnIdx, I64Ty, "vm.cl.fi64b");
 		Value* FTyIdxByte = B.CreateLoad(I8Ty,
 			B.CreateGEP(I8Ty, EffFTyIndices, FnIdx64b, "vm.cl.fig"),

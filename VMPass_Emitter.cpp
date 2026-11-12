@@ -223,6 +223,18 @@ uint32_t BytecodeEmitter::isize(Instruction* I) {
 		auto* GEP = cast<GetElementPtrInst>(I);
 		if (!Ty->isPointerTy()) { markUnsupported(I); return 0; }
 
+		// Struct field access is a constant layout offset (see emit). Same
+		// 6-byte OP_GEP encoding; reject offsets that don't fit a signed i32.
+		if (isa<StructType>(GEP->getSourceElementType())) {
+			unsigned AS = GEP->getPointerAddressSpace();
+			APInt COff(DL->getIndexSizeInBits(AS), 0);
+			if (!GEP->accumulateConstantOffset(*DL, COff) || COff.getActiveBits() > 31) {
+				markUnsupported(I, "struct GEP is not a constant in-range byte offset");
+				return 0;
+			}
+			return 6;
+		}
+
 		// Accept:
 		//  (1) gep ..., base, idx
 		//  (2) gep ..., base, 0, idx   (array decay pattern)
@@ -920,6 +932,26 @@ void BytecodeEmitter::emit(Instruction* I) {
 	}
 	if (Op == Instruction::GetElementPtr && Ty->isPointerTy()) {
 		auto* GEP = cast<GetElementPtrInst>(I);
+
+		// Struct field GEPs are constant byte offsets, not idx * sizeof(field).
+		// `gep %S, p, 0, K` lands at the field's layout offset (padding included).
+		// Encode that as base + offset with elemsz 1. Array GEPs stay idx * stride.
+		if (isa<StructType>(GEP->getSourceElementType())) {
+			unsigned AS = GEP->getPointerAddressSpace();
+			APInt COff(DL->getIndexSizeInBits(AS), 0);
+			if (GEP-> accumulateConstantOffset(*DL, COff) && COff.getActiveBits() <= 31) {
+				auto* CIV = ConstantInt::get(Type::getInt32Ty(GEP->getContext()), COff.getZExtValue());
+				bop(OP_GEP);
+				b8(xorSalt(newPR(I)));
+				b8(xorSalt(pr(GEP->getPointerOperand())));
+				b8(xorSalt(vr(CIV)));
+				b8(1);
+				b8(0);
+				return;
+			}
+			markUnsupported(I, "struct GEP is not a constant in-range byte offset");
+			return;
+		}
 
 		// Accept:
 		//  (1) gep ..., base, idx

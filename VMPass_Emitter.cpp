@@ -940,10 +940,6 @@ void BytecodeEmitter::emit(Instruction* I) {
 				markUnsupported(I, "store of untracked {ptr,i64}");
 				return;
 			}
-			if (NPR >= 250) {
-				markUnsupported(I, "preg file overflow (>250 slots)");
-				return;
-			}
 			auto* ST = cast<StructType>(VT);
 			uint64_t Off1 = DL->getStructLayout(ST)->getElementOffset(1);
 			if (Off1 > 0x7FFFFFFFull) {
@@ -953,12 +949,17 @@ void BytecodeEmitter::emit(Instruction* I) {
 			Value* Base = SI->getPointerOperand();
 			uint8_t Preg = PIt->second.first;
 			uint8_t V64 = PIt->second.second;
-			uint8_t Scratch = NPR++;
+			uint8_t Scratch = allocScratchPR();
+			if (Scratch == kInvalidSlot) {
+				markUnsupported(I, "preg file overflow (>250 slots)");
+				return;
+			}
 			auto* CIV = ConstantInt::get(Type::getInt32Ty(I->getContext()), Off1);
 			bop(OP_STOREPTR); b8(xorSalt(Preg)); b8(xorSalt(pr(Base)));
 			bop(OP_GEP); b8(xorSalt(Scratch)); b8(xorSalt(pr(Base)));
 			b8(xorSalt(vr(CIV))); b8(1); b8(0);
 			bop(OP_STORE64); b8(xorSalt(V64)); b8(xorSalt(Scratch));
+			freeScratchPR(Scratch);
 			return;
 		}
 
@@ -1212,6 +1213,60 @@ void BytecodeEmitter::emit(BasicBlock* BB) {
 	}
 }
 
+// Last-use map for slot reuse. Walk order matches slot assignment. Skipped
+// superOps instructions do not count as uses; fused consumers also account
+// for the folded instruction's operands (emitted at the consumer).
+void BytecodeEmitter::computeLastUses(Function& F) {
+	LastUse.clear();
+	auto account = [&](Value* Op, Instruction* At) {
+		if (!Op || isa<BasicBlock>(Op)) return;
+		LastUse[Op] = At;
+	};
+	for (BasicBlock& BB : F) {
+		for (Instruction& I : BB) {
+			if (SuperOps && (SkippedMuls.count(&I) || SkippedShls.count(&I) ||
+				SkippedCmps.count(&I) || SkippedAnds.count(&I)))
+				continue;
+
+			for (Use& U : I.operands())
+				account(U.get(), &I);
+
+			{
+				auto It = FusedAddToMul.find(&I);
+				if (It != FusedAddToMul.end()) {
+					Instruction* Mul = It->second;
+					account(Mul->getOperand(0), &I);
+					account(Mul->getOperand(1), &I);
+				}
+			}
+			{
+				auto It = FusedAddToShl.find(&I);
+				if (It != FusedAddToShl.end()) {
+					Instruction* Shl = It->second;
+					account(Shl->getOperand(0), &I);
+					account(Shl->getOperand(1), &I);
+				}
+			}
+			{
+				auto It = FusedSelToCmp.find(&I);
+				if (It != FusedSelToCmp.end()) {
+					Instruction* Cmp = It->second;
+					account(Cmp->getOperand(0), &I);
+					account(Cmp->getOperand(1), &I);
+				}
+			}
+			{
+				auto It = FusedCmpToAnd.find(&I);
+				if (It != FusedCmpToAnd.end()) {
+					Instruction* And = It->second;
+					account(And->getOperand(0), &I);
+					account(And->getOperand(1), &I);
+				}
+			}
+		}
+	}
+}
+
 bool BytecodeEmitter::run(Function& F, uint8_t S, const DataLayout& D) {
 
 	// Reset per-run state
@@ -1233,6 +1288,13 @@ bool BytecodeEmitter::run(Function& F, uint8_t S, const DataLayout& D) {
 	PairSlots.clear();
 	Fixups.clear();
 	NVR = NVR64 = NPR = NFR = 0;
+	FreeVR.clear();
+	FreeVR64.clear();
+	FreePR.clear();
+	FreeFR.clear();
+	Pinned.clear();
+	Released.clear();
+	LastUse.clear();
 	FusedAddToMul.clear();
 	SkippedMuls.clear();
 	FusedAddToShl.clear();
@@ -1268,7 +1330,7 @@ bool BytecodeEmitter::run(Function& F, uint8_t S, const DataLayout& D) {
 	if (Unsupported) { setFail(describeUnsupported()); return false; }
 
 
-	// Assign slots for args
+	// Assign slots for args (pinned for whole function)
 	for (Argument& A : F.args()) {
 		Type* AT = A.getType();
 		if (AT->isPointerTy()) newPR(&A);
@@ -1276,6 +1338,7 @@ bool BytecodeEmitter::run(Function& F, uint8_t S, const DataLayout& D) {
 		else if (AT->isIntegerTy()) newVR(&A);
 		else if (AT->isFloatTy() || AT->isDoubleTy()) newFR(&A);
 		else { markUnsupportedValue(&A); }
+		pin(&A);
 	}
 
 	// Assign preg slots for every alloca in the entry block.
@@ -1294,66 +1357,99 @@ bool BytecodeEmitter::run(Function& F, uint8_t S, const DataLayout& D) {
 	// silently dropped from slot assignment, and the bytecode emitter then
 	// asserted "pr(): untracked non-const ptr" on the first store that
 	// referenced one. Scan the whole entry block instead and register every
-	// alloca we find.
+	// alloca we find. Allocas are pinned — addresses stay valid for the
+	// whole function (wrapper seeds them once).
 	for (Instruction& I : F.getEntryBlock()) {
 		auto* AI = dyn_cast<AllocaInst>(&I);
 		if (!AI) continue;
 		PhiAllocaDesc D;
 		D.Slot = newPR(AI);
+		pin(AI);
 		D.AllocTy = AI->getAllocatedType();
 		D.A = AI->getAlign();
 		D.Name = AI->getName().str();
 		PHIAllocas.push_back(std::move(D));
 	}
 
-	// superOps: identify fusion candidates before slot pre-assignment, so the
-	// pre-assignment loop below can skip handing a fused-away mul its own
-	// (unused) slot.
+	// superOps: identify fusion candidates before slot assignment, so the
+	// loop below can skip handing a fused-away mul its own (unused) slot.
 	if (SuperOps) scanSuperOps(F);
 
-	// Pre-assign slots for *all* instruction results (except allocas/unreachable).
-	// This removes any reliance on basic-block iteration order for vr()/pr() lookups,
-	// and makes constants/pointer-const pools naturally allocate "above" all SSA results.
+	computeLastUses(F);
+
+	// Assign slots with liveness reuse: allocate on def, release after last use
+	// in this walk. NVR/NPR/… become the high-water mark (max live).
 	for (BasicBlock& BB : F) {
 		for (Instruction& I : BB) {
-			if (isa<AllocaInst>(&I) || isa<UnreachableInst>(&I)) continue;
+			if (isa<AllocaInst>(&I) || isa<UnreachableInst>(&I)) {
+				releaseDeadAt(&I);
+				continue;
+			}
 
 			// superOps: a fused-away mul's own SSA value never gets a slot --
 			// its result is computed inline by its fused add's OP_MULADD. The
 			// add itself needs no special-casing here: it falls through to
 			// the normal integer-slot assignment just below, exactly as any
 			// other i32-producing instruction would.
-			if (SuperOps && SkippedMuls.count(&I)) continue;
-			if (SuperOps && SkippedShls.count(&I)) continue;
-			if (SuperOps && SkippedCmps.count(&I)) continue;
-			if (SuperOps && SkippedAnds.count(&I)) continue;
+			if (SuperOps && SkippedMuls.count(&I)) {
+				releaseDeadAt(&I);
+				continue;
+			}
+			if (SuperOps && SkippedShls.count(&I)) {
+				releaseDeadAt(&I);
+				continue;
+			}
+			if (SuperOps && SkippedCmps.count(&I)) {
+				releaseDeadAt(&I);
+				continue;
+			}
+			if (SuperOps && SkippedAnds.count(&I)) {
+				releaseDeadAt(&I);
+				continue;
+			}
 
 			Type* Ty = I.getType();
-			if (Ty->isVoidTy()) continue;
+			if (Ty->isVoidTy()) {
+				releaseDeadAt(&I);
+				continue;
+			}
 
 			if (Ty->isPointerTy()) {
 				newPR(&I);
+				releaseDeadAt(&I);
 				continue;
 			}
 
 			if (Ty->isIntegerTy(64)) {
 				newVR64(&I);
+				releaseDeadAt(&I);
 				continue;
 			}
 
 			if (Ty->isIntegerTy()) {
 				unsigned BW = Ty->getIntegerBitWidth();
-				if (BW <= 32) { newVR(&I); continue; }
+				if (BW <= 32) {
+					newVR(&I);
+					releaseDeadAt(&I);
+					continue;
+				}
 			}
 
 			// float/double → freg file
-			if (Ty->isFloatTy() || Ty->isDoubleTy()) { newFR(&I); continue; }
+			if (Ty->isFloatTy() || Ty->isDoubleTy()) {
+				newFR(&I);
+				releaseDeadAt(&I);
+				continue;
+			}
 
 			// {ptr, i64} call result → dual slots; extractvalue aliases them.
+			// Pinned: shared slots must not enter the free list twice.
 			if (isPtrI64PairTy(Ty)) {
 				uint8_t DP = newPR(&I);
 				uint8_t D64 = newVR64(&I);
 				PairSlots[&I] = { DP, D64 };
+				pin(&I);
+				releaseDeadAt(&I);
 				continue;
 			}
 			if (auto* EVI = dyn_cast<ExtractValueInst>(&I)) {
@@ -1364,6 +1460,8 @@ bool BytecodeEmitter::run(Function& F, uint8_t S, const DataLayout& D) {
 					if (PIt != PairSlots.end() && Idx <= 1) {
 						if (Idx == 0) PR[&I] = PIt->second.first;
 						else          VR64[&I] = PIt->second.second;
+						pin(&I);
+						releaseDeadAt(&I);
 						continue;
 					}
 				}
@@ -1371,12 +1469,19 @@ bool BytecodeEmitter::run(Function& F, uint8_t S, const DataLayout& D) {
 
 			// Any other result type is not representable in the current VM ISA.
 			markUnsupportedValue(&I);
+			releaseDeadAt(&I);
 		}
 	}
 
 	if (Unsupported) { setFail(describeUnsupported()); return false; }
 
-
+	// Drop leftover free-list entries before emit. Constants / PtrLoads use
+	// takeFreshSlot; scratch pregs may still recycle via allocScratchPR after
+	// this point, starting from an empty list (bump until first freeScratchPR).
+	FreeVR.clear();
+	FreeVR64.clear();
+	FreePR.clear();
+	FreeFR.clear();
 
 	// Single pass: emit all blocks; emit(BasicBlock*) populates BlockIP as it goes.
 	// Forward branch targets are recorded as Fixups with a 0x00000000 placeholder.
@@ -1468,7 +1573,7 @@ bool BytecodeEmitter::run(Function& F, uint8_t S, const DataLayout& D) {
 
 	if (Unsupported) { setFail(describeUnsupported()); return false; }
 
-	if (NVR > 250 || NVR64 > 250 || NPR > 250 || NFR > 250) {
+	if (NVR > kMaxSlots || NVR64 > kMaxSlots || NPR > kMaxSlots || NFR > kMaxSlots) {
 		setFail("register file size overflow");
 		return false;
 	}

@@ -4,11 +4,12 @@
 //
 // BytecodeEmitter is a two-pass IR → bytecode compiler:
 //
-//   Pass 1  (size)
-//       Walk every instruction in RPO and record the byte-offset of each
-//       basic block's first instruction.  Also assigns all register slots in
-//       declaration order: function arguments first, then entry-block allocas
-//       (demoted PHI nodes), then all remaining instruction results.
+//   Pass 1  (slots)
+//       Assign register slots with liveness reuse: function arguments and
+//       entry-block allocas are pinned for the whole function; remaining SSA
+//       results allocate from a free-list (or bump the high-water mark) and
+//       release their slot after their last use in walk order.  NVR/NPR/…
+//       record the high-water mark (max live), not the instruction count.
 //
 //   Pass 2  (emit)
 //       Walk every instruction again and write the actual opcode bytes into
@@ -57,6 +58,9 @@ namespace llvm {
 
 	struct BytecodeEmitter {
 		static constexpr uint8_t kInvalidSlot = 0xFF;
+		// Soft cap under the u8 ISA index + kInvalidSlot. Overflow = max-live,
+		// not instruction count (see free-list reuse in newVR*).
+		static constexpr uint8_t kMaxSlots = 250;
 
 		// ── Output fields — read by VMImpl after a successful run() ─────────
 
@@ -93,10 +97,10 @@ namespace llvm {
 		SmallVector<std::pair<uint8_t, Value*>, 16> PtrLoads;    // preg   slot, global/null ptr
 		SmallVector<std::pair<uint8_t, ConstantFP*>, 8>  ImmLoadsF;   // freg   slot, ConstantFP (f64/f32) [Step 01.1]
 
-		uint8_t NVR = 0;  // total vreg   slots used
-		uint8_t NVR64 = 0;  // total vreg64 slots used
-		uint8_t NPR = 0;  // total preg   slots used
-		uint8_t NFR = 0;  // total freg   slots used [Step 01.1]
+		uint8_t NVR = 0;  // vreg   high-water (max live)
+		uint8_t NVR64 = 0;  // vreg64 high-water (max live)
+		uint8_t NPR = 0;  // preg   high-water (max live)
+		uint8_t NFR = 0;  // freg   high-water (max live)
 
 
 		// When an instruction cannot be virtualised Unsupported is set and run()
@@ -242,17 +246,133 @@ namespace llvm {
 			return k;
 		}
 
+		// ── Liveness reuse ───────────────────────────────────────────────────
+		// Free lists recycle slots after last use. Pinned values (args, entry
+		// allocas, constants, OP_CALL_PAIR aliases) never release. LastUse maps
+		// each Value* to the Instruction* that is its last consumer in the
+		// same walk order used by slot assignment (see computeLastUses).
+		SmallVector<uint8_t, 32> FreeVR;
+		SmallVector<uint8_t, 32> FreeVR64;
+		SmallVector<uint8_t, 32> FreePR;
+		SmallVector<uint8_t, 32> FreeFR;
+		DenseSet<Value*>         Pinned;
+		DenseSet<Value*>         Released; // idempotent releaseValue (fused+operand overlap)
+		DenseMap<Value*, Instruction*> LastUse;
+
+		void pin(Value* V) { if (V) Pinned.insert(V); }
+
+		// Bump high-water only — for values that must stay valid from function
+		// entry (args already allocated pre-reuse; constants / PtrLoads).
+		uint8_t takeFreshSlot(uint8_t& HighWater, const char* OverflowMsg) {
+			if (HighWater >= kMaxSlots) {
+				Unsupported = true;
+				if (FailReason.empty()) FailReason = OverflowMsg;
+				return kInvalidSlot;
+			}
+			return HighWater++;
+		}
+
+		uint8_t takeSlot(uint8_t& HighWater, SmallVectorImpl<uint8_t>& Free,
+			const char* OverflowMsg) {
+			if (!Free.empty())
+				return Free.pop_back_val();
+			return takeFreshSlot(HighWater, OverflowMsg);
+		}
+
+		// Recycle only values whose every IR user is in the defining block.
+		// Cross-block / loop-carried values keep their slot for the whole
+		// function (safe without full live-out analysis). Same-BB temps —
+		// including those inside loops — are safe: the def re-executes before
+		// the next use on each iteration.
+		bool canRecycle(Value* V) const {
+			auto* DefI = dyn_cast<Instruction>(V);
+			if (!DefI) return false;
+			BasicBlock* DB = DefI->getParent();
+			for (const User* U : V->users()) {
+				auto* UI = dyn_cast<Instruction>(U);
+				if (!UI || UI->getParent() != DB) return false;
+			}
+			return true;
+		}
+
+		void releaseValue(Value* V) {
+			if (!V || Pinned.count(V) || !canRecycle(V)) return;
+			// Fused-operand tryRel can name the same Value* already released via
+			// I->operands() (e.g. muladd `%d=add %m,%a` with `%m=mul %a,%b`, or
+			// cmpsel where a select arm is also a cmp input). Pushing the slot
+			// twice would hand one physical index to two simultaneously live
+			// values — hard overlap / runtime corruption.
+			if (!Released.insert(V).second) return;
+			{
+				auto It = VR.find(V);
+				if (It != VR.end()) { FreeVR.push_back(It->second); return; }
+			}
+			{
+				auto It = VR64.find(V);
+				if (It != VR64.end()) { FreeVR64.push_back(It->second); return; }
+			}
+			{
+				auto It = PR.find(V);
+				if (It != PR.end()) { FreePR.push_back(It->second); return; }
+			}
+			{
+				auto It = FR.find(V);
+				if (It != FR.end()) { FreeFR.push_back(It->second); return; }
+			}
+		}
+
+		void releaseDeadAt(Instruction* I) {
+			auto tryRel = [&](Value* V) {
+				auto It = LastUse.find(V);
+				if (It != LastUse.end() && It->second == I)
+					releaseValue(V);
+			};
+			for (Use& U : I->operands())
+				tryRel(U.get());
+			// superOps: folded operands are read at the consumer but are not
+			// in I's operand list — release them here to match computeLastUses.
+			{
+				auto It = FusedAddToMul.find(I);
+				if (It != FusedAddToMul.end()) {
+					tryRel(It->second->getOperand(0));
+					tryRel(It->second->getOperand(1));
+				}
+			}
+			{
+				auto It = FusedAddToShl.find(I);
+				if (It != FusedAddToShl.end()) {
+					tryRel(It->second->getOperand(0));
+					tryRel(It->second->getOperand(1));
+				}
+			}
+			{
+				auto It = FusedSelToCmp.find(I);
+				if (It != FusedSelToCmp.end()) {
+					tryRel(It->second->getOperand(0));
+					tryRel(It->second->getOperand(1));
+				}
+			}
+			{
+				auto It = FusedCmpToAnd.find(I);
+				if (It != FusedCmpToAnd.end()) {
+					tryRel(It->second->getOperand(0));
+					tryRel(It->second->getOperand(1));
+				}
+			}
+			// Dead def: no recorded use → free immediately after assign.
+			if (!LastUse.count(I))
+				releaseValue(I);
+		}
+
+		void computeLastUses(Function& F);
+
 		// ── Idempotent slot allocation (safe to call in both passes) ─────────
 
 		uint8_t newVR(Value* V) {
 			auto It = VR.find(V);
 			if (It != VR.end()) return It->second;
-			if (NVR >= 250) {
-				Unsupported = true;
-				if (FailReason.empty()) FailReason = "vreg file overflow (>250 slots)";
-				return kInvalidSlot;
-			}
-			uint8_t S = NVR++;
+			uint8_t S = takeSlot(NVR, FreeVR, "vreg file overflow (>250 slots)");
+			if (S == kInvalidSlot) return S;
 			VR[V] = S;
 			return S;
 		}
@@ -260,12 +380,8 @@ namespace llvm {
 		uint8_t newVR64(Value* V) {
 			auto It = VR64.find(V);
 			if (It != VR64.end()) return It->second;
-			if (NVR64 >= 250) {
-				Unsupported = true;
-				if (FailReason.empty()) FailReason = "vreg64 file overflow (>250 slots)";
-				return kInvalidSlot;
-			}
-			uint8_t S = NVR64++;
+			uint8_t S = takeSlot(NVR64, FreeVR64, "vreg64 file overflow (>250 slots)");
+			if (S == kInvalidSlot) return S;
 			VR64[V] = S;
 			return S;
 		}
@@ -274,14 +390,19 @@ namespace llvm {
 		uint8_t newPR(Value* V) {
 			auto It = PR.find(V);
 			if (It != PR.end()) return It->second;
-			if (NPR >= 250) {
-				Unsupported = true;
-				if (FailReason.empty()) FailReason = "preg file overflow (>250 slots)";
-				return kInvalidSlot;
-			}
-			uint8_t S = NPR++;
+			uint8_t S = takeSlot(NPR, FreePR, "preg file overflow (>250 slots)");
+			if (S == kInvalidSlot) return S;
 			PR[V] = S;
 			return S;
+		}
+
+		// Scratch preg for multi-op expansions (e.g. store {ptr,i64}); not tied
+		// to an SSA value. Caller must freeScratchPR after the expansion.
+		uint8_t allocScratchPR() {
+			return takeSlot(NPR, FreePR, "preg file overflow (>250 slots)");
+		}
+		void freeScratchPR(uint8_t S) {
+			if (S != kInvalidSlot) FreePR.push_back(S);
 		}
 
 		// ── Float register slot allocation ───────────────────────
@@ -293,12 +414,8 @@ namespace llvm {
 		uint8_t newFR(Value* V) {
 			auto It = FR.find(V);
 			if (It != FR.end()) return It->second;
-			if (NFR >= 250) {
-				Unsupported = true;
-				if (FailReason.empty()) FailReason = "freg file overflow (>250 slots)";
-				return kInvalidSlot;
-			}
-			uint8_t S = NFR++;
+			uint8_t S = takeSlot(NFR, FreeFR, "freg file overflow (>250 slots)");
+			if (S == kInvalidSlot) return S;
 			FR[V] = S;
 			return S;
 		}
@@ -347,7 +464,12 @@ namespace llvm {
 				if (CI->getType()->getIntegerBitWidth() > 32) { markUnsupportedValue(V); return 0; }
 				auto It = VR.find(V);
 				if (It != VR.end()) return It->second;
-				uint8_t S = newVR(V);
+				// Fresh slot only: ImmLoads / prologue seed at entry; a recycled
+				// index would still be written by the SSA def that freed it.
+				uint8_t S = takeFreshSlot(NVR, "vreg file overflow (>250 slots)");
+				if (S == kInvalidSlot) return S;
+				VR[V] = S;
+				pin(V);
 				ImmLoads.push_back({ S, CI });
 				return S;
 			}
@@ -361,7 +483,10 @@ namespace llvm {
 				if (!CI->getType()->isIntegerTy(64)) { markUnsupportedValue(V); return 0; }
 				auto It = VR64.find(V);
 				if (It != VR64.end()) return It->second;
-				uint8_t S = newVR64(V);
+				uint8_t S = takeFreshSlot(NVR64, "vreg64 file overflow (>250 slots)");
+				if (S == kInvalidSlot) return S;
+				VR64[V] = S;
+				pin(V);
 				ImmLoads64.push_back({ S, CI });
 				return S;
 			}
@@ -375,7 +500,10 @@ namespace llvm {
 			auto It = PR.find(V);
 			if (It != PR.end()) return It->second;
 			assert(isa<Constant>(V) && "pr(): untracked non-const ptr");
-			uint8_t S = newPR(V);
+			uint8_t S = takeFreshSlot(NPR, "preg file overflow (>250 slots)");
+			if (S == kInvalidSlot) return S;
+			PR[V] = S;
+			pin(V);
 			PtrLoads.push_back({ S, V });
 			return S;
 		}
@@ -395,7 +523,10 @@ namespace llvm {
 				}
 				auto It = FR.find(V);
 				if (It != FR.end()) return It->second;
-				uint8_t S = newFR(V);
+				uint8_t S = takeFreshSlot(NFR, "freg file overflow (>250 slots)");
+				if (S == kInvalidSlot) return S;
+				FR[V] = S;
+				pin(V);
 				ImmLoadsF.push_back({ S, CFP });
 				return S;
 			}

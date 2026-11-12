@@ -151,13 +151,16 @@ The VM maintains four separate typed register files:
 
 | File | LLVM alloca type | Purpose | Max slots |
 |---|---|---|---|
-| `vm.regs` | `[N × i32]` | 32-bit integer values | 255 |
-| `vm.regs64` | `[N × i64]` | 64-bit integer values | 255 |
-| `vm.fregs` | `[N × double]` | Floating-point values (all stored as f64) | 255 |
-| `vm.pregs` | `[N × ptr]` | Pointer values | 255 |
+| `vm.regs` | `[N × i32]` | 32-bit integer values | 255 (soft fail at 250) |
+| `vm.regs64` | `[N × i64]` | 64-bit integer values | 255 (soft fail at 250) |
+| `vm.fregs` | `[N × double]` | Floating-point values (all stored as f64) | 255 (soft fail at 250) |
+| `vm.pregs` | `[N × ptr]` | Pointer values | 255 (soft fail at 250) |
 
-Slot 0 in each file is the zero/null sentinel. f32 values are widened to f64 on slot
-assignment and narrowed back when stored to memory or returned.
+The ceiling is the ISA index width (`u8` per slot index), not a tunable knob.
+`N` is the **high-water mark of simultaneously live values** after liveness reuse, not
+the instruction count. Soft fail at 250 leaves headroom under `0xFF` /
+`kInvalidSlot`. f32 values are widened to f64 on slot assignment and narrowed back
+when stored to memory or returned.
 
 ### Interpreter state
 
@@ -203,14 +206,24 @@ gets a `preg` slot pointing to the alloca.
 
 ### Slot assignment — Pass 1
 
-`BytecodeEmitter::run()` performs a first walk in Reverse Post-Order (RPO) to:
+`BytecodeEmitter::run()` assigns slots with **liveness reuse**:
 
-1. Assign register slots in declaration order: function arguments → entry-block allocas
-   (from PHI demotion) → all remaining SSA instruction results.
-2. Record the byte offset (`BlockIP`) of each basic block's first instruction.
-3. Build constant materialisation lists (`ImmLoads`, `ImmLoads64`, `ImmLoadsF`, `PtrLoads`).
+1. Pin function arguments and entry-block allocas for the whole function.
+2. Compute each value's last use in walk order (`computeLastUses`), accounting for
+   fused `superOps` consumers so folded instructions do not extend live ranges.
+3. Walk instructions: allocate a slot on def (free-list first, else bump high-water);
+   after each instruction, release slots whose last use is that instruction — but only
+   when every IR user of that value is in its defining block (same-BB temps). Cross-block
+   and loop-carried values stay allocated for the whole function (no full live-out pass).
+   Releases are idempotent (`Released` set) so a value named both as a consumer operand
+   and as a fused superOps input is not pushed onto the free-list twice.
+4. Constants / `PtrLoads` take a **fresh** high-water slot only (never the free-list) and
+   are pinned — they are seeded at entry (wrapper or constInStream prologue).
+5. `{ptr,i64}` pair slots and their `extractvalue` aliases are pinned (shared indices).
 
-Slot assignment is deterministic for a given IR because RPO is stable under the same seed.
+`NVR` / `NVR64` / `NPR` / `NFR` store the high-water mark (max live). Overflow means
+max-live exceeded 250, not that the function had too many instructions. Indices stay
+`u8` in the bytecode ISA — raising the limit past 255 requires an ISA-wide widen.
 
 ### Bytecode emission — Pass 2
 

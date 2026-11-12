@@ -5,11 +5,11 @@
 // BytecodeEmitter is a two-pass IR → bytecode compiler:
 //
 //   Pass 1  (slots)
-//       Assign register slots with liveness reuse: function arguments and
+//       Assign register slots with CFG-aware liveness reuse: arguments and
 //       entry-block allocas are pinned for the whole function; remaining SSA
-//       results allocate from a free-list (or bump the high-water mark) and
-//       release their slot after their last use in walk order.  NVR/NPR/…
-//       record the high-water mark (max live), not the instruction count.
+//       results allocate from a free-list (or bump high-water) and release
+//       after the last use in a block when the value is not LiveOut there.
+//       NVR/NPR/… record the high-water mark (max live), not instruction count.
 //
 //   Pass 2  (emit)
 //       Walk every instruction again and write the actual opcode bytes into
@@ -29,6 +29,7 @@
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
@@ -247,17 +248,19 @@ namespace llvm {
 		}
 
 		// ── Liveness reuse ───────────────────────────────────────────────────
-		// Free lists recycle slots after last use. Pinned values (args, entry
-		// allocas, constants, OP_CALL_PAIR aliases) never release. LastUse maps
-		// each Value* to the Instruction* that is its last consumer in the
-		// same walk order used by slot assignment (see computeLastUses).
+		// Free-list recycle after last use in a BB when V ∉ LiveOut[BB]
+		// (CFG-accurate; loop-carried / cross-block stays live). Pinned values
+		// (args, entry allocas, constants, OP_CALL_PAIR aliases) never release.
+		// LastUseInBB: last semantic consumer per block (skipped superOps are
+		// not consumers; fused extras are attributed to the consumer).
 		SmallVector<uint8_t, 32> FreeVR;
 		SmallVector<uint8_t, 32> FreeVR64;
 		SmallVector<uint8_t, 32> FreePR;
 		SmallVector<uint8_t, 32> FreeFR;
 		DenseSet<Value*>         Pinned;
 		DenseSet<Value*>         Released; // idempotent releaseValue (fused+operand overlap)
-		DenseMap<Value*, Instruction*> LastUse;
+		DenseMap<BasicBlock*, SmallPtrSet<Value*, 16>> LiveOut;
+		DenseMap<BasicBlock*, DenseMap<Value*, Instruction*>> LastUseInBB;
 
 		void pin(Value* V) { if (V) Pinned.insert(V); }
 
@@ -279,58 +282,68 @@ namespace llvm {
 			return takeFreshSlot(HighWater, OverflowMsg);
 		}
 
-		// Recycle only values whose every IR user is in the defining block.
-		// Cross-block / loop-carried values keep their slot for the whole
-		// function (safe without full live-out analysis). Same-BB temps —
-		// including those inside loops — are safe: the def re-executes before
-		// the next use on each iteration.
-		bool canRecycle(Value* V) const {
-			auto* DefI = dyn_cast<Instruction>(V);
-			if (!DefI) return false;
-			BasicBlock* DB = DefI->getParent();
-			for (const User* U : V->users()) {
-				auto* UI = dyn_cast<Instruction>(U);
-				if (!UI || UI->getParent() != DB) return false;
-			}
-			return true;
+		bool isSkippedSuperOp(Instruction* I) const {
+			return SuperOps && I &&
+				(SkippedMuls.count(I) || SkippedShls.count(I) ||
+				 SkippedCmps.count(I) || SkippedAnds.count(I));
 		}
 
 		void releaseValue(Value* V) {
-			if (!V || Pinned.count(V) || !canRecycle(V)) return;
-			// Fused-operand tryRel can name the same Value* already released via
-			// I->operands() (e.g. muladd `%d=add %m,%a` with `%m=mul %a,%b`, or
-			// cmpsel where a select arm is also a cmp input). Pushing the slot
-			// twice would hand one physical index to two simultaneously live
-			// values — hard overlap / runtime corruption.
-			if (!Released.insert(V).second) return;
+			if (!V || Pinned.count(V) || Released.count(V)) return;
+			// Only mark Released when a real slot is returned — otherwise a
+			// premature tryRel (use visited before def in walk order) would
+			// poison V and permanently leak its later-allocated slot.
+			auto push = [&](SmallVectorImpl<uint8_t>& Free, uint8_t S) {
+				Released.insert(V);
+				Free.push_back(S);
+			};
 			{
 				auto It = VR.find(V);
-				if (It != VR.end()) { FreeVR.push_back(It->second); return; }
+				if (It != VR.end()) { push(FreeVR, It->second); return; }
 			}
 			{
 				auto It = VR64.find(V);
-				if (It != VR64.end()) { FreeVR64.push_back(It->second); return; }
+				if (It != VR64.end()) { push(FreeVR64, It->second); return; }
 			}
 			{
 				auto It = PR.find(V);
-				if (It != PR.end()) { FreePR.push_back(It->second); return; }
+				if (It != PR.end()) { push(FreePR, It->second); return; }
 			}
 			{
 				auto It = FR.find(V);
-				if (It != FR.end()) { FreeFR.push_back(It->second); return; }
+				if (It != FR.end()) { push(FreeFR, It->second); return; }
 			}
 		}
 
 		void releaseDeadAt(Instruction* I) {
+			BasicBlock* BB = I->getParent();
+			const SmallPtrSetImpl<Value*>* Out = nullptr;
+			auto OutIt = LiveOut.find(BB);
+			if (OutIt != LiveOut.end()) Out = &OutIt->second;
+			auto LUIt = LastUseInBB.find(BB);
+			const DenseMap<Value*, Instruction*>* LU =
+				LUIt != LastUseInBB.end() ? &LUIt->second : nullptr;
+
 			auto tryRel = [&](Value* V) {
-				auto It = LastUse.find(V);
-				if (It != LastUse.end() && It->second == I)
-					releaseValue(V);
+				if (!V || !LU) return;
+				auto It = LU->find(V);
+				if (It == LU->end() || It->second != I) return;
+				if (Out && Out->count(V)) return; // still live into a successor
+				// Recycle only in the defining block. Cross-block free depends
+				// entirely on LiveOut completeness; a miss aliases two live
+				// pregs/vregs and SIGSEGVs at runtime. Same-BB + LiveOut still
+				// covers in-block temps and loop bodies (def re-executes).
+				if (auto* DefI = dyn_cast<Instruction>(V)) {
+					if (DefI->getParent() != BB) return;
+				} else {
+					return; // args are pinned anyway
+				}
+				releaseValue(V);
 			};
 			for (Use& U : I->operands())
 				tryRel(U.get());
 			// superOps: folded operands are read at the consumer but are not
-			// in I's operand list — release them here to match computeLastUses.
+			// in I's operand list — release them here to match LastUseInBB.
 			{
 				auto It = FusedAddToMul.find(I);
 				if (It != FusedAddToMul.end()) {
@@ -359,12 +372,13 @@ namespace llvm {
 					tryRel(It->second->getOperand(1));
 				}
 			}
-			// Dead def: no recorded use → free immediately after assign.
-			if (!LastUse.count(I))
+			// Dead def in this BB: no use in BB and not LiveOut → free now.
+			if ((!LU || !LU->count(I)) && !(Out && Out->count(I)))
 				releaseValue(I);
 		}
 
-		void computeLastUses(Function& F);
+		void computeLiveness(Function& F);
+		void computeLastUsesInBB(Function& F);
 
 		// ── Idempotent slot allocation (safe to call in both passes) ─────────
 

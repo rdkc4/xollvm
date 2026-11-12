@@ -206,20 +206,20 @@ gets a `preg` slot pointing to the alloca.
 
 ### Slot assignment — Pass 1
 
-`BytecodeEmitter::run()` assigns slots with **liveness reuse**:
+`BytecodeEmitter::run()` assigns slots with **CFG live-out reuse**:
 
 1. Pin function arguments and entry-block allocas for the whole function.
-2. Compute each value's last use in walk order (`computeLastUses`), accounting for
-   fused `superOps` consumers so folded instructions do not extend live ranges.
-3. Walk instructions: allocate a slot on def (free-list first, else bump high-water);
-   after each instruction, release slots whose last use is that instruction — but only
-   when every IR user of that value is in its defining block (same-BB temps). Cross-block
-   and loop-carried values stay allocated for the whole function (no full live-out pass).
-   Releases are idempotent (`Released` set) so a value named both as a consumer operand
-   and as a fused superOps input is not pushed onto the free-list twice.
-4. Constants / `PtrLoads` take a **fresh** high-water slot only (never the free-list) and
-   are pinned — they are seeded at entry (wrapper or constInStream prologue).
-5. `{ptr,i64}` pair slots and their `extractvalue` aliases are pinned (shared indices).
+2. `computeLiveness`: backward dataflow `LiveOut[BB]` over semantic uses (skipped
+   `superOps` are not uses; fused consumers also read folded operands).
+3. `computeLastUsesInBB`: last semantic consumer of each value per block.
+4. Walk BBs in RPO: allocate on def (free-list first, else bump high-water); after
+   each instruction, release a value when it is that block's last use, `V ∉
+   LiveOut[BB]`, **and** the def is in the same BB (cross-block recycle disabled —
+   LiveOut misses alias slots and SIGSEGV at runtime). Same-BB + LiveOut still
+   recycles in-block temps / loop-body defs. `Released` only arms after a real free.
+5. Constants / `PtrLoads` take a **fresh** high-water slot only (never the free-list)
+   and are pinned — seeded at entry (wrapper or constInStream prologue).
+6. `{ptr,i64}` pair slots and their `extractvalue` aliases are pinned (shared indices).
 
 `NVR` / `NVR64` / `NPR` / `NFR` store the high-water mark (max live). Overflow means
 max-live exceeded 250, not that the function had too many instructions. Indices stay

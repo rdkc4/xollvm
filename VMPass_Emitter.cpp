@@ -5,8 +5,11 @@
 #include "llvm/Transforms/Obfuscator/VMPass_Emitter.h"
 
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/PostOrderIterator.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
+#include "llvm/IR/CFG.h"
 
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
@@ -1213,54 +1216,113 @@ void BytecodeEmitter::emit(BasicBlock* BB) {
 	}
 }
 
-// Last-use map for slot reuse. Walk order matches slot assignment. Skipped
-// superOps instructions do not count as uses; fused consumers also account
-// for the folded instruction's operands (emitted at the consumer).
-void BytecodeEmitter::computeLastUses(Function& F) {
-	LastUse.clear();
+// Tracked for LiveOut: args + non-void non-alloca instructions (slot candidates).
+static bool isLivenessTracked(Value* V) {
+	if (isa<Argument>(V)) return true;
+	auto* I = dyn_cast<Instruction>(V);
+	return I && !I->getType()->isVoidTy() && !isa<AllocaInst>(I);
+}
+
+// Backward dataflow LiveOut. Skipped superOps are not semantic uses; fused
+// consumers also read the folded instruction's operands (matches emit).
+void BytecodeEmitter::computeLiveness(Function& F) {
+	LiveOut.clear();
+	DenseMap<BasicBlock*, SmallPtrSet<Value*, 16>> LiveIn;
+
+	auto addSemanticUses = [&](Instruction* I, SmallPtrSetImpl<Value*>& Live) {
+		if (isSkippedSuperOp(I)) return;
+		for (Use& U : I->operands()) {
+			Value* Op = U.get();
+			if (isLivenessTracked(Op)) Live.insert(Op);
+		}
+		auto add2 = [&](Instruction* Folded) {
+			if (!Folded) return;
+			if (isLivenessTracked(Folded->getOperand(0)))
+				Live.insert(Folded->getOperand(0));
+			if (isLivenessTracked(Folded->getOperand(1)))
+				Live.insert(Folded->getOperand(1));
+		};
+		{
+			auto It = FusedAddToMul.find(I);
+			if (It != FusedAddToMul.end()) add2(It->second);
+		}
+		{
+			auto It = FusedAddToShl.find(I);
+			if (It != FusedAddToShl.end()) add2(It->second);
+		}
+		{
+			auto It = FusedSelToCmp.find(I);
+			if (It != FusedSelToCmp.end()) add2(It->second);
+		}
+		{
+			auto It = FusedCmpToAnd.find(I);
+			if (It != FusedCmpToAnd.end()) add2(It->second);
+		}
+	};
+
+	bool Changed = true;
+	while (Changed) {
+		Changed = false;
+		for (BasicBlock* BB : post_order(&F)) {
+			SmallPtrSet<Value*, 16> Live;
+			for (BasicBlock* S : successors(BB)) {
+				auto It = LiveIn.find(S);
+				if (It == LiveIn.end()) continue;
+				Live.insert(It->second.begin(), It->second.end());
+			}
+			LiveOut[BB] = Live;
+			for (Instruction& I : reverse(*BB)) {
+				if (isLivenessTracked(&I))
+					Live.erase(&I);
+				addSemanticUses(&I, Live);
+			}
+			auto& In = LiveIn[BB];
+			if (In != Live) {
+				In = std::move(Live);
+				Changed = true;
+			}
+		}
+	}
+}
+
+// Per-BB last semantic use (same attribution rules as computeLiveness).
+void BytecodeEmitter::computeLastUsesInBB(Function& F) {
+	LastUseInBB.clear();
 	auto account = [&](Value* Op, Instruction* At) {
-		if (!Op || isa<BasicBlock>(Op)) return;
-		LastUse[Op] = At;
+		if (!Op || !isLivenessTracked(Op)) return;
+		LastUseInBB[At->getParent()][Op] = At;
 	};
 	for (BasicBlock& BB : F) {
 		for (Instruction& I : BB) {
-			if (SuperOps && (SkippedMuls.count(&I) || SkippedShls.count(&I) ||
-				SkippedCmps.count(&I) || SkippedAnds.count(&I)))
-				continue;
-
+			if (isSkippedSuperOp(&I)) continue;
 			for (Use& U : I.operands())
 				account(U.get(), &I);
-
 			{
 				auto It = FusedAddToMul.find(&I);
 				if (It != FusedAddToMul.end()) {
-					Instruction* Mul = It->second;
-					account(Mul->getOperand(0), &I);
-					account(Mul->getOperand(1), &I);
+					account(It->second->getOperand(0), &I);
+					account(It->second->getOperand(1), &I);
 				}
 			}
 			{
 				auto It = FusedAddToShl.find(&I);
 				if (It != FusedAddToShl.end()) {
-					Instruction* Shl = It->second;
-					account(Shl->getOperand(0), &I);
-					account(Shl->getOperand(1), &I);
+					account(It->second->getOperand(0), &I);
+					account(It->second->getOperand(1), &I);
 				}
 			}
 			{
 				auto It = FusedSelToCmp.find(&I);
 				if (It != FusedSelToCmp.end()) {
-					Instruction* Cmp = It->second;
-					account(Cmp->getOperand(0), &I);
-					account(Cmp->getOperand(1), &I);
+					account(It->second->getOperand(0), &I);
+					account(It->second->getOperand(1), &I);
 				}
 			}
 			{
 				auto It = FusedCmpToAnd.find(&I);
 				if (It != FusedCmpToAnd.end()) {
-					Instruction* And = It->second;
-					account(And->getOperand(0), &I);
-					account(And->getOperand(1), &I);
+					account(It->second->getOperand(0), &I);
+					account(It->second->getOperand(1), &I);
 				}
 			}
 		}
@@ -1294,7 +1356,8 @@ bool BytecodeEmitter::run(Function& F, uint8_t S, const DataLayout& D) {
 	FreeFR.clear();
 	Pinned.clear();
 	Released.clear();
-	LastUse.clear();
+	LiveOut.clear();
+	LastUseInBB.clear();
 	FusedAddToMul.clear();
 	SkippedMuls.clear();
 	FusedAddToShl.clear();
@@ -1375,102 +1438,101 @@ bool BytecodeEmitter::run(Function& F, uint8_t S, const DataLayout& D) {
 	// loop below can skip handing a fused-away mul its own (unused) slot.
 	if (SuperOps) scanSuperOps(F);
 
-	computeLastUses(F);
+	computeLiveness(F);
+	computeLastUsesInBB(F);
 
-	// Assign slots with liveness reuse: allocate on def, release after last use
-	// in this walk. NVR/NPR/… become the high-water mark (max live).
-	for (BasicBlock& BB : F) {
-		for (Instruction& I : BB) {
-			if (isa<AllocaInst>(&I) || isa<UnreachableInst>(&I)) {
-				releaseDeadAt(&I);
-				continue;
-			}
-
-			// superOps: a fused-away mul's own SSA value never gets a slot --
-			// its result is computed inline by its fused add's OP_MULADD. The
-			// add itself needs no special-casing here: it falls through to
-			// the normal integer-slot assignment just below, exactly as any
-			// other i32-producing instruction would.
-			if (SuperOps && SkippedMuls.count(&I)) {
-				releaseDeadAt(&I);
-				continue;
-			}
-			if (SuperOps && SkippedShls.count(&I)) {
-				releaseDeadAt(&I);
-				continue;
-			}
-			if (SuperOps && SkippedCmps.count(&I)) {
-				releaseDeadAt(&I);
-				continue;
-			}
-			if (SuperOps && SkippedAnds.count(&I)) {
-				releaseDeadAt(&I);
-				continue;
-			}
-
-			Type* Ty = I.getType();
-			if (Ty->isVoidTy()) {
-				releaseDeadAt(&I);
-				continue;
-			}
-
-			if (Ty->isPointerTy()) {
-				newPR(&I);
-				releaseDeadAt(&I);
-				continue;
-			}
-
-			if (Ty->isIntegerTy(64)) {
-				newVR64(&I);
-				releaseDeadAt(&I);
-				continue;
-			}
-
-			if (Ty->isIntegerTy()) {
-				unsigned BW = Ty->getIntegerBitWidth();
-				if (BW <= 32) {
-					newVR(&I);
-					releaseDeadAt(&I);
-					continue;
-				}
-			}
-
-			// float/double → freg file
-			if (Ty->isFloatTy() || Ty->isDoubleTy()) {
-				newFR(&I);
-				releaseDeadAt(&I);
-				continue;
-			}
-
-			// {ptr, i64} call result → dual slots; extractvalue aliases them.
-			// Pinned: shared slots must not enter the free list twice.
-			if (isPtrI64PairTy(Ty)) {
-				uint8_t DP = newPR(&I);
-				uint8_t D64 = newVR64(&I);
-				PairSlots[&I] = { DP, D64 };
-				pin(&I);
-				releaseDeadAt(&I);
-				continue;
-			}
-			if (auto* EVI = dyn_cast<ExtractValueInst>(&I)) {
-				Value* Agg = EVI->getAggregateOperand();
-				if (EVI->getNumIndices() == 1 && isPtrI64PairTy(Agg->getType())) {
-					unsigned Idx = EVI->getIndices()[0];
-					auto PIt = PairSlots.find(Agg);
-					if (PIt != PairSlots.end() && Idx <= 1) {
-						if (Idx == 0) PR[&I] = PIt->second.first;
-						else          VR64[&I] = PIt->second.second;
-						pin(&I);
-						releaseDeadAt(&I);
-						continue;
-					}
-				}
-			}
-
-			// Any other result type is not representable in the current VM ISA.
-			markUnsupportedValue(&I);
+	// Assign slots in RPO so defs tend to precede uses; release when the last
+	// use in a BB fires and V ∉ LiveOut[BB]. NVR/NPR/… = high-water (max live).
+	auto assignOne = [&](Instruction& I) {
+		if (isa<AllocaInst>(&I) || isa<UnreachableInst>(&I)) {
 			releaseDeadAt(&I);
+			return;
 		}
+
+		// superOps: a fused-away mul's own SSA value never gets a slot --
+		// its result is computed inline by its fused add's OP_MULADD. The
+		// add itself needs no special-casing here: it falls through to
+		// the normal integer-slot assignment just below, exactly as any
+		// other i32-producing instruction would.
+		if (isSkippedSuperOp(&I)) {
+			releaseDeadAt(&I);
+			return;
+		}
+
+		Type* Ty = I.getType();
+		if (Ty->isVoidTy()) {
+			releaseDeadAt(&I);
+			return;
+		}
+
+		if (Ty->isPointerTy()) {
+			newPR(&I);
+			releaseDeadAt(&I);
+			return;
+		}
+
+		if (Ty->isIntegerTy(64)) {
+			newVR64(&I);
+			releaseDeadAt(&I);
+			return;
+		}
+
+		if (Ty->isIntegerTy()) {
+			unsigned BW = Ty->getIntegerBitWidth();
+			if (BW <= 32) {
+				newVR(&I);
+				releaseDeadAt(&I);
+				return;
+			}
+		}
+
+		// float/double → freg file
+		if (Ty->isFloatTy() || Ty->isDoubleTy()) {
+			newFR(&I);
+			releaseDeadAt(&I);
+			return;
+		}
+
+		// {ptr, i64} call result → dual slots; extractvalue aliases them.
+		// Pinned: shared slots must not enter the free list twice.
+		if (isPtrI64PairTy(Ty)) {
+			uint8_t DP = newPR(&I);
+			uint8_t D64 = newVR64(&I);
+			PairSlots[&I] = { DP, D64 };
+			pin(&I);
+			releaseDeadAt(&I);
+			return;
+		}
+		if (auto* EVI = dyn_cast<ExtractValueInst>(&I)) {
+			Value* Agg = EVI->getAggregateOperand();
+			if (EVI->getNumIndices() == 1 && isPtrI64PairTy(Agg->getType())) {
+				unsigned Idx = EVI->getIndices()[0];
+				auto PIt = PairSlots.find(Agg);
+				if (PIt != PairSlots.end() && Idx <= 1) {
+					if (Idx == 0) PR[&I] = PIt->second.first;
+					else          VR64[&I] = PIt->second.second;
+					pin(&I);
+					releaseDeadAt(&I);
+					return;
+				}
+			}
+		}
+
+		// Any other result type is not representable in the current VM ISA.
+		markUnsupportedValue(&I);
+		releaseDeadAt(&I);
+	};
+
+	SmallPtrSet<BasicBlock*, 32> SeenBB;
+	for (BasicBlock* BB : ReversePostOrderTraversal<Function*>(&F)) {
+		SeenBB.insert(BB);
+		for (Instruction& I : *BB)
+			assignOne(I);
+	}
+	for (BasicBlock& BB : F) {
+		if (SeenBB.count(&BB)) continue;
+		for (Instruction& I : BB)
+			assignOne(I);
 	}
 
 	if (Unsupported) { setFail(describeUnsupported()); return false; }

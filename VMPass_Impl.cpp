@@ -50,7 +50,7 @@ bool VMImpl::run() {
 
 	//     Lower/strip intrinsics that clang emits at -O0 but the VM cannot
 	//      encode.  Three tiers:
-	//        A) Strip  — debug, lifetime, assume, freeze: zero/identity semantics.
+	//        A) Strip  — debug, lifetime, assume, expect, freeze: zero/identity.
 	//        B) Memory — memcpy/memset/memmove const size ≤ 64: chunked
 	//                    i64/i32/i16/i8 load+store (or store-of-fill). memmove
 	//                    uses an entry alloca temp then two forward copies.
@@ -121,6 +121,10 @@ bool VMImpl::run() {
 			case Intrinsic::assume:
 				CI->eraseFromParent();
 				continue;
+			case Intrinsic::expect:
+			        CI->replaceAllUsesWith(CI->getArgOperand(0));
+			        CI->eraseFromParent();
+			        continue;
 			default: break;
 			}
 

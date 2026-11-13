@@ -56,8 +56,9 @@ bool VMImpl::run() {
 	//                    uses an entry alloca temp then two forward copies.
 	//        C) Float  — fabs, fmuladd, fma, minnum, maxnum, copysign:
 	//                    expand to FNeg/FMul/FAdd/FCmp/Select the VM handles.
-	//        D) Int    — abs; umul.with.overflow (i32/i64): expand to IR the
-	//                    VM already encodes.
+	//        D) Int    — abs; umul.with.overflow (i32/i64); ctpop (i32/i64):
+	//                    expand to IR the VM already encodes.
+	//      Also: load {i64,i64} with extractvalue-only users → two i64 loads.
 	//      Anything else stays and isize() will markUnsupported gracefully.
 	{
 		constexpr uint64_t kMemExpandMax = 1024;
@@ -279,11 +280,96 @@ bool VMImpl::run() {
 				}
 			}
 
+			//  Tier D: ctpop → SWAR parallel bitcount (OP_BINOP-friendly).
+			if (IID == Intrinsic::ctpop) {
+				Value* X = CI->getArgOperand(0);
+				Type* IT = X->getType();
+				unsigned BW = IT->isIntegerTy() ? IT->getIntegerBitWidth() : 0;
+				if (BW == 32 || BW == 64) {
+					auto C = [&](uint64_t V) { return ConstantInt::get(IT, V); };
+					auto shr = [&](Value* V, unsigned S, const Twine& N) {
+						return B.CreateLShr(V, C(S), N);
+					};
+					// x = x - ((x >> 1) & 0x5555...)
+					Value* T = B.CreateSub(X,
+						B.CreateAnd(shr(X, 1, "ct.pop.s1"),
+							C(BW == 32 ? 0x55555555ull : 0x5555555555555555ull),
+							"ct.pop.a1"),
+						"ct.pop.t1");
+					// x = (x & 0x3333...) + ((x >> 2) & 0x3333...)
+					T = B.CreateAdd(
+						B.CreateAnd(T, C(BW == 32 ? 0x33333333ull : 0x3333333333333333ull),
+							"ct.pop.a2"),
+						B.CreateAnd(shr(T, 2, "ct.pop.s2"),
+							C(BW == 32 ? 0x33333333ull : 0x3333333333333333ull),
+							"ct.pop.a3"),
+						"ct.pop.t2");
+					// x = (x + (x >> 4)) & 0x0F0F...
+					T = B.CreateAnd(
+						B.CreateAdd(T, shr(T, 4, "ct.pop.s4"), "ct.pop.t3"),
+						C(BW == 32 ? 0x0F0F0F0Full : 0x0F0F0F0F0F0F0F0Full),
+						"ct.pop.t4");
+					T = B.CreateAdd(T, shr(T, 8, "ct.pop.s8"), "ct.pop.t5");
+					T = B.CreateAdd(T, shr(T, 16, "ct.pop.s16"), "ct.pop.t6");
+					if (BW == 64)
+						T = B.CreateAdd(T, shr(T, 32, "ct.pop.s32"), "ct.pop.t7");
+					Value* R = B.CreateAnd(T, C(BW == 32 ? 0x3Full : 0x7Full), "ct.pop.r");
+					CI->replaceAllUsesWith(R);
+					CI->eraseFromParent();
+					continue;
+				}
+			}
+
 			// Anything else: leave in place, isize() will markUnsupported.
 		}
 	}
 
-
+	// load {i64,i64} is not a VM slot type. When every use is extractvalue
+	// 0/1, split into two i64 loads and rewrite the extracts.
+	{
+		const DataLayout& DL = F.getParent()->getDataLayout();
+		SmallVector<LoadInst*, 16> AggLoads;
+		for (BasicBlock& BB : F)
+			for (Instruction& I : BB) {
+				auto* LI = dyn_cast<LoadInst>(&I);
+				if (!LI) continue;
+				auto* ST = dyn_cast<StructType>(LI->getType());
+				if (!ST || ST->getNumElements() != 2) continue;
+				if (!ST->getElementType(0)->isIntegerTy(64) ||
+					!ST->getElementType(1)->isIntegerTy(64))
+					continue;
+				bool Ok = !LI->user_empty();
+				for (User* U : LI->users()) {
+					auto* EV = dyn_cast<ExtractValueInst>(U);
+					if (!EV || EV->getNumIndices() != 1 || EV->getIndices()[0] > 1) {
+						Ok = false;
+						break;
+					}
+				}
+				if (Ok) AggLoads.push_back(LI);
+			}
+		for (LoadInst* LI : AggLoads) {
+			IRBuilder<> B(LI);
+			Value* Base = LI->getPointerOperand();
+			Type* I64 = Type::getInt64Ty(Ctx);
+			Align A = LI->getAlign();
+			Value* V0 = B.CreateAlignedLoad(I64, Base, A, LI->isVolatile(), "ldi64.0");
+			uint64_t Off1 = DL.getStructLayout(cast<StructType>(LI->getType()))
+				->getElementOffset(1);
+			Value* P1 = Off1
+				? B.CreateGEP(I8Ty, Base, B.getInt64(Off1), "ldi64.p1")
+				: Base;
+			Value* V1 = B.CreateAlignedLoad(I64, P1, A, LI->isVolatile(), "ldi64.1");
+			SmallVector<ExtractValueInst*, 4> Extracts;
+			for (User* U : LI->users())
+				Extracts.push_back(cast<ExtractValueInst>(U));
+			for (ExtractValueInst* EV : Extracts) {
+				EV->replaceAllUsesWith(EV->getIndices()[0] == 0 ? V0 : V1);
+				EV->eraseFromParent();
+			}
+			LI->eraseFromParent();
+		}
+	}
 
 	// Widen f32 allocas to f64 so OP_LOAD_F / OP_STORE_F (which always
 	// operate on 8 bytes) never read/write past the end of a 4-byte slot.

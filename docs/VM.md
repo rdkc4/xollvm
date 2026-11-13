@@ -204,9 +204,15 @@ Before slot assignment, `VMImpl::run()` rewrites IR the emitter cannot encode:
 
 - **Tier B:** `memcpy` / `memset` / `memmove` with constant size in `(0, 1024]` → chunked
   i64/i32/i16/i8 load/store (memmove via an entry alloca temp).
-- **Tier C/D:** float helpers (`fabs`, `fmuladd`, …), `abs`, and
-  `llvm.umul.with.overflow` (i32/i64) → mul plus an unsigned-overflow i1, with
-  `extractvalue` users rewritten (the `{iN,i1}` aggregate is not a VM slot type).
+- **Tier C/D:** float helpers (`fabs`, `fmuladd`, …), `abs`,
+  `llvm.umul.with.overflow` (i32/i64) → mul plus an unsigned-overflow i1 (extractvalue
+  rewritten), and `llvm.ctpop` (i32/i64) → SWAR parallel bitcount.
+- **`load {i64,i64}`** with extractvalue-only users → two aligned `load i64` (base /
+  base+offset); aggregate is not a VM slot type.
+
+Fully-constant GEPs of any index count (multi-dim arrays, struct fields, …) encode as
+`OP_GEP` with byte offset and `elemsz=1`. Soft CALL arg limit is `kVMCallMaxArgs` (64;
+encoding hard max 127).
 
 ### PHI demotion
 
@@ -299,7 +305,7 @@ passed through a per-function permutation (see [Opcode permutation](#opcode-perm
 | `OP_INTTOPTR` | 0x06 | `opc dstp:u8 src:u8` (3 B) | `inttoptr` vreg → preg. |
 | `OP_LOAD32` | 0x07 | `opc dst:u8 ptrreg:u8` (3 B) | Load i32 from address in preg. |
 | `OP_STORE32` | 0x08 | `opc val:u8 ptrreg:u8` (3 B) | Store i32 to address in preg. |
-| `OP_GEP` | 0x09 | `opc dstp:u8 basep:u8 idx:u8 elemsz:u16le` (6 B) | GEP: `basep + idx * elemsz` → preg. |
+| `OP_GEP` | 0x09 | `opc dstp:u8 basep:u8 idx:u8 elemsz:u16le` (6 B) | GEP: `basep + idx * elemsz` → preg. Fully-constant multi-index GEPs use byte offset with `elemsz=1`. |
 | `OP_LOAD8` | 0x1B | `opc dst:u8 ptrreg:u8` (3 B) | Load i8 (zero-extend to i32). `load i1` is this plus `CK_TRUNC1` on the same slot. |
 | `OP_STORE8` | 0x1C | `opc val:u8 ptrreg:u8` (3 B) | Truncate vreg to i8, store. Also used for `store i1` (1-byte). |
 | `OP_LOAD16` | 0x1D | `opc dst:u8 ptrreg:u8` (3 B) | Load i16 (zero-extend to i32). |
@@ -374,19 +380,17 @@ assignment; f32 destinations are narrowed on store or return.
 <details>
 <summary><b>📞 Call opcodes</b></summary>
 
-All call opcodes share the same extended encoding (Step 02 format):
+All call opcodes share:
 
 ```
-opc  [dst_reg:u8]  fn:u8  nargs:u8  flags:u8  argtypes:u16le  [arg:u8 × nargs]
+opc  [dst_reg:u8…]  fn:u8  nargs:u8  [ind_preg:u8?]  [arg:u8 × (nargs&0x7F)]
 ```
 
-- `fn` — index into the per-function callee table.
-- `nargs` — number of arguments (max 8).
-- `flags` — `CF_VARARG (0x01)` if the callee is variadic; otherwise `CF_NONE (0x00)`.
-- `argtypes` — 2 bits per argument (packed little-endian): `CAT_VREG=0`, `CAT_PREG=1`,
-  `CAT_VREG64=2`, `CAT_FREG=3`.
-- Each `arg:u8` — register slot index in the corresponding register file.
-- Bit 7 of `nargs` marks an indirect call. The real argument count is `nargs & 0x7F`, and the next byte is the preg holding the callee pointer. `fn` still selects the `FunctionType`; the callee-table slot itself is null. Direct calls leave bit 7 clear and have no extra byte.
+- `fn` — index into the per-function callee / `FunctionType` table.
+- `nargs` — low 7 bits = argument count (soft max `kVMCallMaxArgs` = 64; encode max 127).
+  Bit 7 set ⇒ indirect: next byte is the preg holding the callee pointer.
+- Arg types come from `GVFTyIndices` / concrete `FunctionType`, not an inline bitfield.
+- Each `arg:u8` — register slot in the matching file (vreg / preg / vreg64 / freg).
 
 | Logical opcode | Value | Return |
 |---|---|---|
@@ -501,8 +505,8 @@ is rounded back to f32 precision via fptrunc→fpext before being stored).
 | `OP_RET_VOID` | 1 | `opc` |
 | `OP_RET_INT` | 2 | `opc src` |
 | `OP_RET_PTR` | 2 | `opc srcp` |
-| `OP_CALL_VOID` | 3+N | `opc fn nargs flags at0 at1 [arg]×N` |
-| `OP_CALL_INT/PTR/INT64/F` | 4+N | `opc dst fn nargs flags at0 at1 [arg]×N` |
+| `OP_CALL_VOID` | 3+N | `opc fn nargs [arg]×N` (+1 if indirect) |
+| `OP_CALL_INT/PTR/INT64/F` | 4+N | `opc dst fn nargs [arg]×N` (+1 if indirect) |
 
 </details>
 

@@ -114,7 +114,7 @@ namespace llvm {
 			// no flags/ArgTypes bytes.
 			if (FnIdx >= E.CalleeTab.size())
 				return fail(IP, Twine("OP_CALL fn index out of range: ") + Twine((unsigned)FnIdx));
-			if (NArgs > 16)
+			if (NArgs > kVMCallMaxArgs)
 				return fail(IP, Twine("OP_CALL nargs too large: ") + Twine((unsigned)NArgs));
 
 			uint32_t Extra = Ind ? 1u : 0u;

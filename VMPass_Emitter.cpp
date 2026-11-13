@@ -233,38 +233,35 @@ uint32_t BytecodeEmitter::isize(Instruction* I) {
 		auto* GEP = cast<GetElementPtrInst>(I);
 		if (!Ty->isPointerTy()) { markUnsupported(I); return 0; }
 
-		// Struct field access is a constant layout offset (see emit). Same
-		// 6-byte OP_GEP encoding; reject offsets that don't fit a signed i32.
-		if (isa<StructType>(GEP->getSourceElementType())) {
+		// Any fully-constant GEP (struct fields, multi-dim arrays, …) → byte
+		// offset with elemsz 1. Same 6-byte OP_GEP encoding.
+		{
 			unsigned AS = GEP->getPointerAddressSpace();
 			APInt COff(DL->getIndexSizeInBits(AS), 0);
-			if (!GEP->accumulateConstantOffset(*DL, COff) || COff.getActiveBits() > 31) {
-				markUnsupported(I, "struct GEP is not a constant in-range byte offset");
-				return 0;
+			if (GEP->accumulateConstantOffset(*DL, COff)) {
+				if (COff.getActiveBits() > 31) {
+					markUnsupported(I, "GEP constant byte offset exceeds i32");
+					return 0;
+				}
+				return 6;
 			}
-			return 6;
 		}
 
-		// Accept:
+		// Variable index:
 		//  (1) gep ..., base, idx
 		//  (2) gep ..., base, 0, idx   (array decay pattern)
 		Value* IdxV = nullptr;
 		if (GEP->getNumIndices() == 1) {
 			IdxV = *GEP->idx_begin();
-
-		}
-		else if (GEP->getNumIndices() == 2) {
+		} else if (GEP->getNumIndices() == 2) {
 			auto It = GEP->idx_begin();
 			Value* I0 = *It++;
 			Value* I1 = *It++;
 			auto* C0 = dyn_cast<ConstantInt>(I0);
 			if (!C0 || !C0->isZero()) { markUnsupported(I); return 0; }
 			IdxV = I1;
-
-		}
-		else {
+		} else {
 			markUnsupported(I); return 0;
-
 		}
 
 		Type* IT = IdxV->getType();
@@ -296,7 +293,7 @@ uint32_t BytecodeEmitter::isize(Instruction* I) {
 			markUnsupported(I); return 0;
 		}
 		if (NA > kVMCallMaxArgs) {
-			markUnsupported(I, "CALL arg count exceeds MaxArgs (32)");
+			markUnsupported(I, "CALL arg count exceeds MaxArgs (64)");
 			return 0;
 		}
 		// Indirect: extra preg byte after nargs (bit 7 of nargs).
@@ -977,14 +974,18 @@ void BytecodeEmitter::emit(Instruction* I) {
 	if (Op == Instruction::GetElementPtr && Ty->isPointerTy()) {
 		auto* GEP = cast<GetElementPtrInst>(I);
 
-		// Struct field GEPs are constant byte offsets, not idx * sizeof(field).
-		// `gep %S, p, 0, K` lands at the field's layout offset (padding included).
-		// Encode that as base + offset with elemsz 1. Array GEPs stay idx * stride.
-		if (isa<StructType>(GEP->getSourceElementType())) {
+		// Fully-constant GEPs (struct fields, multi-dim arrays, …): encode as
+		// base + byte offset with elemsz 1. Variable array GEPs use idx * stride.
+		{
 			unsigned AS = GEP->getPointerAddressSpace();
 			APInt COff(DL->getIndexSizeInBits(AS), 0);
-			if (GEP-> accumulateConstantOffset(*DL, COff) && COff.getActiveBits() <= 31) {
-				auto* CIV = ConstantInt::get(Type::getInt32Ty(GEP->getContext()), COff.getZExtValue());
+			if (GEP->accumulateConstantOffset(*DL, COff)) {
+				if (COff.getActiveBits() > 31) {
+					markUnsupported(I, "GEP constant byte offset exceeds i32");
+					return;
+				}
+				auto* CIV = ConstantInt::get(
+					Type::getInt32Ty(GEP->getContext()), COff.getZExtValue());
 				bop(OP_GEP);
 				b8(xorSalt(newPR(I)));
 				b8(xorSalt(pr(GEP->getPointerOperand())));
@@ -993,26 +994,22 @@ void BytecodeEmitter::emit(Instruction* I) {
 				b8(0);
 				return;
 			}
-			markUnsupported(I, "struct GEP is not a constant in-range byte offset");
-			return;
 		}
 
-		// Accept:
+		// Variable index:
 		//  (1) gep ..., base, idx
 		//  (2) gep ..., base, 0, idx
 		Value* IdxV = nullptr;
 		if (GEP->getNumIndices() == 1) {
 			IdxV = *GEP->idx_begin();
-		}
-		else if (GEP->getNumIndices() == 2) {
+		} else if (GEP->getNumIndices() == 2) {
 			auto It = GEP->idx_begin();
 			Value* I0 = *It++;
 			Value* I1 = *It++;
 			auto* C0 = dyn_cast<ConstantInt>(I0);
 			if (!C0 || !C0->isZero()) { markUnsupported(I); return; }
 			IdxV = I1;
-		}
-		else {
+		} else {
 			markUnsupported(I); return;
 		}
 
@@ -1096,7 +1093,7 @@ void BytecodeEmitter::emit(Instruction* I) {
 		uint8_t FI = IndCall ? indirectCalleeSlot(ConcreteFTy) : callee(Fn, ConcreteFTy);
 		unsigned NAw = CI->arg_size();
 		if (NAw > kVMCallMaxArgs) {
-			markUnsupported(I, "CALL arg count exceeds MaxArgs (32)");
+			markUnsupported(I, "CALL arg count exceeds MaxArgs (64)");
 			return;
 		}
 		uint8_t NA = (uint8_t)NAw;

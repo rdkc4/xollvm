@@ -268,9 +268,10 @@ namespace llvm {
 	// In the current encoding, argument type info is carried per-callee in
 	// GVFTyIndices rather than inline in the bytecode, so the 8-argument
 	// bitfield limit no longer applies.  nargs low 7 bits allow ≤127; the
-	// CALL handler preloads kVMCallMaxArgs slots (raised 16→32 for fat
-	// Debug varargs).
-	static constexpr unsigned kVMCallMaxArgs = 32;
+	// CALL handler preloads kVMCallMaxArgs slots (raised 16→32→64 for fat
+	// Debug / large C++ method calls). Encoding hard max remains 127 (nargs
+	// low 7 bits; bit 7 = indirect).
+	static constexpr unsigned kVMCallMaxArgs = 64;
 
 	enum CallArgType : uint8_t {
 		CAT_VREG = 0,  // i32  — read from vm.regs

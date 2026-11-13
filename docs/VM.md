@@ -198,6 +198,16 @@ a subsequent `-O2` pipeline.
 
 If the function is skipped, the skip reason is recorded in the obfuscation report JSON.
 
+### Intrinsic / mem pre-lowering
+
+Before slot assignment, `VMImpl::run()` rewrites IR the emitter cannot encode:
+
+- **Tier B:** `memcpy` / `memset` / `memmove` with constant size in `(0, 1024]` → chunked
+  i64/i32/i16/i8 load/store (memmove via an entry alloca temp).
+- **Tier C/D:** float helpers (`fabs`, `fmuladd`, …), `abs`, and
+  `llvm.umul.with.overflow` (i32/i64) → mul plus an unsigned-overflow i1, with
+  `extractvalue` users rewritten (the `{iN,i1}` aggregate is not a VM slot type).
+
 ### PHI demotion
 
 The bytecode ISA has no PHI concept. Before bytecode emission, all PHI nodes are demoted to
@@ -282,7 +292,7 @@ passed through a per-function permutation (see [Opcode permutation](#opcode-perm
 | `OP_LOADI` | 0x00 | `opc dst:u8 imm:i32le` (6 B) | Load 32-bit immediate into vreg. |
 | `OP_MOVR` | 0x01 | `opc dst:u8 src:u8` (3 B) | Copy vreg to vreg. |
 | `OP_BINOP` | 0x02 | `opc dst:u8 a:u8 b:u8 subop:u8` (5 B) | Binary integer op on vregs (all integer `BW≤32`, incl. i1/i8/i16). See BinSubop table. |
-| `OP_ICMP` | 0x03 | `opc dst:u8 a:u8 b:u8 pred:u8` (5 B) | Integer compare; result (0/1) into vreg. |
+| `OP_ICMP` | 0x03 | `opc dst:u8 a:u8 b:u8 pred:u8` (5 B) | Integer compare on i32-file values (all integer `BW≤32`, incl. i1/i8/i16); result (0/1) into vreg. |
 | `OP_ICMP_PTR` | 0x38 | `opc dst:u8 a:u8 b:u8 pred:u8` (5 B) | Pointer compare (`eq`/`ne`); preg×preg → vreg 0/1. |
 | `OP_CAST` | 0x04 | `opc dst:u8 src:u8 kind:u8` (4 B) | Integer widening/narrowing within the i32 file (incl. `zext i1→i8`). See CastKind table. |
 | `OP_PTRTOINT` | 0x05 | `opc dst:u8 srcp:u8` (3 B) | `ptrtoint` preg → vreg (i32). |

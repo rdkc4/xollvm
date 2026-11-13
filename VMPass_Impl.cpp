@@ -51,15 +51,16 @@ bool VMImpl::run() {
 	//     Lower/strip intrinsics that clang emits at -O0 but the VM cannot
 	//      encode.  Three tiers:
 	//        A) Strip  — debug, lifetime, assume, expect, freeze: zero/identity.
-	//        B) Memory — memcpy/memset/memmove const size ≤ 128: chunked
+	//        B) Memory — memcpy/memset/memmove const size ≤ 1024: chunked
 	//                    i64/i32/i16/i8 load+store (or store-of-fill). memmove
 	//                    uses an entry alloca temp then two forward copies.
 	//        C) Float  — fabs, fmuladd, fma, minnum, maxnum, copysign:
 	//                    expand to FNeg/FMul/FAdd/FCmp/Select the VM handles.
-	//        D) Int    — abs: expand to ICmp/Sub/Select.
+	//        D) Int    — abs; umul.with.overflow (i32/i64): expand to IR the
+	//                    VM already encodes.
 	//      Anything else stays and isize() will markUnsupported gracefully.
 	{
-		constexpr uint64_t kMemExpandMax = 128;
+		constexpr uint64_t kMemExpandMax = 1024;
 
 		auto emitMemChunks = [&](IRBuilder<>& B, Value* Dst, Value* Src,
 			uint64_t Sz, uint8_t FillByte, bool IsSet) {
@@ -128,7 +129,7 @@ bool VMImpl::run() {
 			default: break;
 			}
 
-			//  Tier B: memcpy / memmove (≤128 chunked)
+			//  Tier B: memcpy / memmove (≤1024 chunked)
 			if (IID == Intrinsic::memcpy || IID == Intrinsic::memmove) {
 				if (auto* SzC = dyn_cast<ConstantInt>(CI->getArgOperand(2))) {
 					uint64_t Sz = SzC->getZExtValue();
@@ -153,7 +154,7 @@ bool VMImpl::run() {
 				continue; // non-constant / too large → markUnsupported later
 			}
 
-			//  Tier B: memset (≤128 chunked)
+			//  Tier B: memset (≤1024 chunked)
 			if (IID == Intrinsic::memset) {
 				auto* SzC = dyn_cast<ConstantInt>(CI->getArgOperand(2));
 				auto* ValC = dyn_cast<ConstantInt>(CI->getArgOperand(1));
@@ -233,6 +234,49 @@ bool VMImpl::run() {
 				CI->replaceAllUsesWith(R);
 				CI->eraseFromParent();
 				continue;
+			}
+
+			//  Tier D: umul.with.overflow → {mul, ov} via extractvalue rewrite.
+			//  {iN,i1} is not a VM slot type; expand before emit. Only i32/i64.
+			if (IID == Intrinsic::umul_with_overflow) {
+				Value* A = CI->getArgOperand(0);
+				Value* Bv = CI->getArgOperand(1);
+				Type* IT = A->getType();
+				unsigned BW = IT->isIntegerTy() ? IT->getIntegerBitWidth() : 0;
+				if (BW == 32 || BW == 64) {
+					bool Ok = true;
+					for (User* U : CI->users()) {
+						auto* EV = dyn_cast<ExtractValueInst>(U);
+						if (!EV || EV->getNumIndices() != 1 || EV->getIndices()[0] > 1) {
+							Ok = false;
+							break;
+						}
+					}
+					if (Ok) {
+						Value* Mul = B.CreateMul(A, Bv, "umul.mul");
+						Value* Zero = ConstantInt::get(IT, 0);
+						Value* One = ConstantInt::get(IT, 1);
+						Value* Max = ConstantInt::get(IT, -1); // UINT_MAX
+						// ov = (B != 0) && (A > umax/B); use BSafe so udiv never ÷0.
+						Value* BSafe = B.CreateSelect(
+							B.CreateICmpEQ(Bv, Zero, "umul.bz"), One, Bv, "umul.bs");
+						Value* Ov = B.CreateAnd(
+							B.CreateICmpNE(Bv, Zero, "umul.bnz"),
+							B.CreateICmpUGT(A, B.CreateUDiv(Max, BSafe, "umul.lim"),
+								"umul.gt"),
+							"umul.ov");
+						SmallVector<ExtractValueInst*, 4> Extracts;
+						for (User* U : CI->users())
+							Extracts.push_back(cast<ExtractValueInst>(U));
+						for (ExtractValueInst* EV : Extracts) {
+							EV->replaceAllUsesWith(
+								EV->getIndices()[0] == 0 ? Mul : Ov);
+							EV->eraseFromParent();
+						}
+						CI->eraseFromParent();
+						continue;
+					}
+				}
 			}
 
 			// Anything else: leave in place, isize() will markUnsupported.

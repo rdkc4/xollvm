@@ -107,7 +107,11 @@ uint32_t BytecodeEmitter::isize(Instruction* I) {
 		auto* CI = cast<ICmpInst>(I);
 		Type* T0 = CI->getOperand(0)->getType();
 		Type* T1 = CI->getOperand(1)->getType();
-		if (T0->isIntegerTy(32) && T1->isIntegerTy(32)) return 5;
+		// i1/i8/i16/i32 share the i32 vreg file + OP_ICMP (same as OP_BINOP).
+		if (T0->isIntegerTy() && T1->isIntegerTy() &&
+			T0->getIntegerBitWidth() <= 32 && T1->getIntegerBitWidth() <= 32 &&
+			T0->getIntegerBitWidth() == T1->getIntegerBitWidth())
+			return 5;
 		if (T0->isIntegerTy(64) && T1->isIntegerTy(64)) return 5;
 		if (T0->isPointerTy() && T1->isPointerTy()) {
 			auto P = CI->getPredicate();
@@ -680,7 +684,9 @@ void BytecodeEmitter::emit(Instruction* I) {
 		Type* T0 = CI->getOperand(0)->getType();
 		Type* T1 = CI->getOperand(1)->getType();
 
-		if (T0->isIntegerTy(32) && T1->isIntegerTy(32)) {
+		if (T0->isIntegerTy() && T1->isIntegerTy() &&
+			T0->getIntegerBitWidth() <= 32 && T1->getIntegerBitWidth() <= 32 &&
+			T0->getIntegerBitWidth() == T1->getIntegerBitWidth()) {
 			bop(OP_ICMP);
 			b8(xorSalt(newVR(I)));
 			b8(xorSalt(vr(CI->getOperand(0))));

@@ -60,7 +60,9 @@ namespace {
 		if (!BO->getType()->isIntegerTy())
 			return false;
 		unsigned BW = cast<IntegerType>(BO->getType())->getBitWidth();
-		if (BW < 2)
+		// Odd-width / non-native ints (bitfields) are legalized by VM. MBA
+		// rewriting them into add/sub/mul chains makes that legalize fail.
+		if (BW != 8 && BW != 16 && BW != 32 && BW != 64)
 			return false;
 
 		if (hasPoisonSensitiveFlags(*BO))
@@ -252,6 +254,28 @@ namespace {
 	static bool runMBA(MbaCtx& PCtx, int probability, unsigned depth, unsigned maxSites) {
 		Function& F = PCtx.F;
 		FunctionObfContext& Ctx = PCtx.FOC;
+
+		// VM bytecode uses a u8 slot index (≤254 live). Full MBA on large
+		// funclib bodies (PopulateVsrc*, executeVOP*M*) inflates live SSA
+		// past that cap. When VM is co-enabled, keep MBA light so virtualize
+		// still succeeds — prefer VM coverage over MBA density.
+		if (PCtx.OC.isPassEnabled("vm") && maxSites > 0) {
+			// Empirically: 12 deep-MBA sites on ~600-inst VOP5MFma still
+			// pushes live vregs past u8; 8 sites stay ~140.
+			unsigned Cap = maxSites;
+			if (Ctx.NumInsts > 500)
+				Cap = 8;
+			else if (Ctx.NumInsts > 300)
+				Cap = 16;
+			else if (Ctx.NumInsts > 150)
+				Cap = 32;
+			if (Cap < maxSites) {
+				maxSites = Cap;
+				if (ObfVerbose)
+					errs() << "[mba] vm-coexist throttled maxSites to " << maxSites
+						<< " (insts=" << Ctx.NumInsts << ")\n";
+			}
+		}
 
 		// Budget-aware site cap: estimate ~15-40 insts per site depending on
 		// depth.  This is the *initial* estimate; the live cap below tightens

@@ -61,7 +61,8 @@ namespace llvm {
 		static constexpr uint8_t kInvalidSlot = 0xFF;
 		// Soft cap under the u8 ISA index + kInvalidSlot. Overflow = max-live,
 		// not instruction count (see free-list reuse in newVR*).
-		static constexpr uint8_t kMaxSlots = 250;
+		// uint8_t slot index in bytecode; leave 255 as sentinel (kInvalidSlot).
+		static constexpr uint8_t kMaxSlots = 255;
 
 		// ── Output fields — read by VMImpl after a successful run() ─────────
 
@@ -269,7 +270,10 @@ namespace llvm {
 		uint8_t takeFreshSlot(uint8_t& HighWater, const char* OverflowMsg) {
 			if (HighWater >= kMaxSlots) {
 				Unsupported = true;
-				if (FailReason.empty()) FailReason = OverflowMsg;
+				if (FailReason.empty()) {
+					FailReason = std::string(OverflowMsg) + " at " +
+						std::to_string((unsigned)HighWater);
+				}
 				return kInvalidSlot;
 			}
 			return HighWater++;
@@ -385,7 +389,7 @@ namespace llvm {
 		uint8_t newVR(Value* V) {
 			auto It = VR.find(V);
 			if (It != VR.end()) return It->second;
-			uint8_t S = takeSlot(NVR, FreeVR, "vreg file overflow (>250 slots)");
+			uint8_t S = takeSlot(NVR, FreeVR, "vreg file overflow (>254 slots)");
 			if (S == kInvalidSlot) return S;
 			VR[V] = S;
 			return S;
@@ -394,7 +398,7 @@ namespace llvm {
 		uint8_t newVR64(Value* V) {
 			auto It = VR64.find(V);
 			if (It != VR64.end()) return It->second;
-			uint8_t S = takeSlot(NVR64, FreeVR64, "vreg64 file overflow (>250 slots)");
+			uint8_t S = takeSlot(NVR64, FreeVR64, "vreg64 file overflow (>254 slots)");
 			if (S == kInvalidSlot) return S;
 			VR64[V] = S;
 			return S;
@@ -404,7 +408,7 @@ namespace llvm {
 		uint8_t newPR(Value* V) {
 			auto It = PR.find(V);
 			if (It != PR.end()) return It->second;
-			uint8_t S = takeSlot(NPR, FreePR, "preg file overflow (>250 slots)");
+			uint8_t S = takeSlot(NPR, FreePR, "preg file overflow (>254 slots)");
 			if (S == kInvalidSlot) return S;
 			PR[V] = S;
 			return S;
@@ -413,7 +417,7 @@ namespace llvm {
 		// Scratch preg for multi-op expansions (e.g. store {ptr,i64}); not tied
 		// to an SSA value. Caller must freeScratchPR after the expansion.
 		uint8_t allocScratchPR() {
-			return takeSlot(NPR, FreePR, "preg file overflow (>250 slots)");
+			return takeSlot(NPR, FreePR, "preg file overflow (>254 slots)");
 		}
 		void freeScratchPR(uint8_t S) {
 			if (S != kInvalidSlot) FreePR.push_back(S);
@@ -428,7 +432,7 @@ namespace llvm {
 		uint8_t newFR(Value* V) {
 			auto It = FR.find(V);
 			if (It != FR.end()) return It->second;
-			uint8_t S = takeSlot(NFR, FreeFR, "freg file overflow (>250 slots)");
+			uint8_t S = takeSlot(NFR, FreeFR, "freg file overflow (>254 slots)");
 			if (S == kInvalidSlot) return S;
 			FR[V] = S;
 			return S;
@@ -480,7 +484,7 @@ namespace llvm {
 				if (It != VR.end()) return It->second;
 				// Fresh slot only: ImmLoads / prologue seed at entry; a recycled
 				// index would still be written by the SSA def that freed it.
-				uint8_t S = takeFreshSlot(NVR, "vreg file overflow (>250 slots)");
+				uint8_t S = takeFreshSlot(NVR, "vreg file overflow (>254 slots)");
 				if (S == kInvalidSlot) return S;
 				VR[V] = S;
 				pin(V);
@@ -497,7 +501,7 @@ namespace llvm {
 				if (!CI->getType()->isIntegerTy(64)) { markUnsupportedValue(V); return 0; }
 				auto It = VR64.find(V);
 				if (It != VR64.end()) return It->second;
-				uint8_t S = takeFreshSlot(NVR64, "vreg64 file overflow (>250 slots)");
+				uint8_t S = takeFreshSlot(NVR64, "vreg64 file overflow (>254 slots)");
 				if (S == kInvalidSlot) return S;
 				VR64[V] = S;
 				pin(V);
@@ -514,7 +518,7 @@ namespace llvm {
 			auto It = PR.find(V);
 			if (It != PR.end()) return It->second;
 			assert(isa<Constant>(V) && "pr(): untracked non-const ptr");
-			uint8_t S = takeFreshSlot(NPR, "preg file overflow (>250 slots)");
+			uint8_t S = takeFreshSlot(NPR, "preg file overflow (>254 slots)");
 			if (S == kInvalidSlot) return S;
 			PR[V] = S;
 			pin(V);
@@ -537,7 +541,7 @@ namespace llvm {
 				}
 				auto It = FR.find(V);
 				if (It != FR.end()) return It->second;
-				uint8_t S = takeFreshSlot(NFR, "freg file overflow (>250 slots)");
+				uint8_t S = takeFreshSlot(NFR, "freg file overflow (>254 slots)");
 				if (S == kInvalidSlot) return S;
 				FR[V] = S;
 				pin(V);

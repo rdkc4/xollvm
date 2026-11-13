@@ -1,11 +1,15 @@
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/CFG.h"
+#include "llvm/IR/AttributeMask.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
+#include "llvm/IR/DebugInfo.h"
+#include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
@@ -14,11 +18,14 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/Operator.h"
 #include "llvm/Support/Alignment.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
+#include "llvm/IR/ValueMap.h"
 
 #include "llvm/Transforms/Obfuscator/VMPass_Impl.h"
 #include "llvm/Transforms/Obfuscator/VMPass_ISA.h"
@@ -26,7 +33,10 @@
 #include "llvm/Transforms/Obfuscator/VMPass_Verifier.h"
 #include "llvm/Transforms/Obfuscator/ObfuscationOptions.h"
 
+#include <algorithm>
+#include <cctype>
 #include <functional>
+#include <string>
 using namespace llvm;
 
 #define DEBUG_TYPE "vm"
@@ -36,6 +46,346 @@ STATISTIC(VMFunctions, "Functions virtualised by VMPass");
 
 
 bool VMImpl::run() {
+	// ── Auto-split: native public shell + virtualized core ─────────────
+	// va_start must run in the varargs frame (public F). Odd-pair returns of
+	// F itself are not a single WrapRetKind slot — demote to sret core.
+	auto wipeBody = [&](Function& Fn) {
+		SmallVector<BasicBlock*, 32> BBs;
+		for (BasicBlock& BB : Fn) BBs.push_back(&BB);
+		for (BasicBlock* BB : BBs) BB->dropAllReferences();
+		for (BasicBlock* BB : BBs) BB->eraseFromParent();
+	};
+
+	// CloneFunctionInto copies Src's dso_local/visibility onto NewFunc and
+	// replaces fn/ret/param attrs — InternalLinkage helpers must be fixed up.
+	auto finalizeInternalHelper = [&](Function* H) {
+		H->setLinkage(GlobalValue::InternalLinkage);
+		H->setVisibility(GlobalValue::DefaultVisibility);
+		H->setDLLStorageClass(GlobalValue::DefaultStorageClass);
+		H->setDSOLocal(true);
+		H->addFnAttr(Attribute::NoInline);
+		H->addFnAttr(Attribute::NoUnwind);
+		stripDebugInfo(*H);
+	};
+
+	auto captureShellDebugLoc = [&]() -> DebugLoc {
+		if (DISubprogram* SP = F.getSubprogram()) {
+			for (BasicBlock& BB : F)
+				for (Instruction& I : BB)
+					if (I.getDebugLoc())
+						return I.getDebugLoc();
+			return DILocation::get(Ctx, SP->getScopeLine(), 0, SP);
+		}
+		return DebugLoc();
+	};
+
+	auto virtualizeCore = [&](Function* Core) -> bool {
+		unsigned PoolIdx = computePoolIdx(F, Cfg, MasterSeed);
+		VMImpl Inner(*Core, Cfg, R, MasterSeed, PoolIdx);
+		if (!Inner.run()) {
+			FailReason = Inner.FailReason;
+			return false;
+		}
+		// Outer Impl.E never ran — steal Inner stats so VMPass verbose log
+		// is not "0B bytecode" for the public shell name.
+		E.BC = std::move(Inner.E.BC);
+		E.NVR = Inner.E.NVR;
+		E.NVR64 = Inner.E.NVR64;
+		E.NPR = Inner.E.NPR;
+		E.NFR = Inner.E.NFR;
+		return true;
+	};
+
+	// (1) Varargs + llvm.va_start → shell keeps va_start/end; core gets va_list*.
+	{
+		SmallVector<CallInst*, 4> VaStarts;
+		for (BasicBlock& BB : F)
+			for (Instruction& I : BB)
+				if (auto* CI = dyn_cast<CallInst>(&I))
+					if (Function* CF = CI->getCalledFunction();
+						CF && CF->getIntrinsicID() == Intrinsic::vastart)
+						VaStarts.push_back(CI);
+
+		if (!VaStarts.empty() && F.isVarArg()) {
+			SmallVector<Type*, 8> Params;
+			for (Argument& A : F.args())
+				Params.push_back(A.getType());
+			Params.push_back(PtrTy);
+			FunctionType* CoreTy = FunctionType::get(F.getReturnType(), Params, false);
+			std::string CoreName = ("__vm_core_va_" + F.getName()).str();
+			for (char& C : CoreName)
+				if (!std::isalnum((unsigned char)C) && C != '_') C = '_';
+			Function* Core = Function::Create(
+				CoreTy, GlobalValue::InternalLinkage, CoreName, &M);
+
+			ValueToValueMapTy VMap;
+			auto CA = Core->arg_begin();
+			for (Argument& A : F.args()) {
+				CA->setName(A.getName());
+				VMap[&A] = &*CA++;
+			}
+			Argument* ValistArg = &*CA;
+			ValistArg->setName("valist");
+
+			SmallVector<ReturnInst*, 8> Returns;
+			CloneFunctionInto(Core, &F, VMap,
+				CloneFunctionChangeType::LocalChangesOnly, Returns);
+			finalizeInternalHelper(Core);
+
+			// Capture shell material before F's body is wiped (VaStarts dangle after).
+			auto vaListAllocaTy = [&](Value* VaStartArg) -> Type* {
+				Value* Base = VaStartArg;
+				if (auto* GEP = dyn_cast<GEPOperator>(Base))
+					Base = GEP->getPointerOperand();
+				Base = Base->stripPointerCasts();
+				if (auto* AI = dyn_cast<AllocaInst>(Base))
+					return AI->getAllocatedType();
+				return nullptr;
+			};
+			Type* VaListTy = vaListAllocaTy(VaStarts[0]->getArgOperand(0));
+			if (!VaListTy)
+				VaListTy = ArrayType::get(
+					StructType::get(Ctx, { I32Ty, I32Ty, PtrTy, PtrTy }), 1);
+
+			Function* VaStartF = VaStarts[0]->getCalledFunction();
+			Function* VaEndF = nullptr;
+			for (BasicBlock& BB : F) {
+				for (Instruction& I : BB) {
+					if (auto* CI = dyn_cast<CallInst>(&I))
+						if (Function* CF = CI->getCalledFunction();
+							CF && CF->getIntrinsicID() == Intrinsic::vaend) {
+							VaEndF = CF;
+							break;
+						}
+				}
+				if (VaEndF) break;
+			}
+			if (!VaEndF)
+				VaEndF = VaStartF; // last resort; should not happen with clang IR
+
+			// Drop va_start / va_end in core; redirect the va_list alloca to the arg.
+			SmallVector<AllocaInst*, 4> DeadAllocas;
+			for (BasicBlock& BB : *Core) {
+				for (Instruction& I : llvm::make_early_inc_range(BB)) {
+					auto* CI = dyn_cast<CallInst>(&I);
+					if (!CI) continue;
+					Function* CF = CI->getCalledFunction();
+					if (!CF) continue;
+					Intrinsic::ID IID = CF->getIntrinsicID();
+					if (IID == Intrinsic::vastart) {
+						Value* Op = CI->getArgOperand(0);
+						Value* Base = Op;
+						if (auto* GEP = dyn_cast<GEPOperator>(Base))
+							Base = GEP->getPointerOperand();
+						Base = Base->stripPointerCasts();
+						CI->eraseFromParent();
+						if (auto* AI = dyn_cast<AllocaInst>(Base)) {
+							AI->replaceAllUsesWith(ValistArg);
+							DeadAllocas.push_back(AI);
+						}
+					} else if (IID == Intrinsic::vaend) {
+						CI->eraseFromParent();
+					}
+				}
+			}
+			for (AllocaInst* AI : DeadAllocas)
+				if (AI->use_empty())
+					AI->eraseFromParent();
+
+			DebugLoc ShellDL = captureShellDebugLoc();
+			LLVM_DEBUG(dbgs() << "[vm] varargs auto-split '" << F.getName()
+				<< "' → core '" << Core->getName() << "'\n");
+			if (!virtualizeCore(Core)) {
+				Core->eraseFromParent();
+				return false;
+			}
+
+			wipeBody(F);
+			BasicBlock* Entry = BasicBlock::Create(Ctx, "entry", &F);
+			IRBuilder<> B(Entry);
+			if (ShellDL)
+				B.SetCurrentDebugLocation(ShellDL);
+			AllocaInst* Ap = B.CreateAlloca(VaListTy, nullptr, "ap");
+			// Clang passes gep(array_alloca,0,0) to va_start/va_end.
+			Value* ApArg = Ap;
+			if (VaListTy->isArrayTy())
+				ApArg = B.CreateConstInBoundsGEP2_64(VaListTy, Ap, 0, 0, "ap.el");
+			B.CreateCall(VaStartF, { ApArg });
+			SmallVector<Value*, 8> CallArgs;
+			for (Argument& A : F.args())
+				CallArgs.push_back(&A);
+			// Core expects the same base the original alloca occupied (array ptr).
+			CallArgs.push_back(Ap);
+			CallInst* CR = F.getReturnType()->isVoidTy()
+				? B.CreateCall(Core, CallArgs)
+				: B.CreateCall(Core, CallArgs, "core.r");
+			B.CreateCall(VaEndF, { ApArg });
+			if (F.getReturnType()->isVoidTy())
+				B.CreateRetVoid();
+			else
+				B.CreateRet(CR);
+			return true;
+		}
+	}
+
+	auto isVmScalarTy = [&](Type* T) -> bool {
+		if (T->isPointerTy()) return true;
+		if (!T->isIntegerTy()) return false;
+		unsigned W = T->getIntegerBitWidth();
+		return W == 1 || W == 8 || W == 16 || W == 32 || W == 64;
+	};
+	auto isSupportedPairElem = [&](Type* T) -> bool {
+		if (T->isPointerTy()) return true;
+		if (!T->isIntegerTy()) return false;
+		unsigned W = T->getIntegerBitWidth();
+		return W <= 32 || W == 64;
+	};
+	auto isPtrI64Pair = [&](Type* T) -> bool {
+		auto* ST = dyn_cast<StructType>(T);
+		return ST && ST->getNumElements() == 2 &&
+			ST->getElementType(0)->isPointerTy() &&
+			ST->getElementType(1)->isIntegerTy(64);
+	};
+
+	// (2) Odd-pair return of F → sret core + insertvalue shell.
+	{
+		auto* ST = dyn_cast<StructType>(F.getReturnType());
+		if (ST && ST->getNumElements() == 2 && !isPtrI64Pair(ST) &&
+			isSupportedPairElem(ST->getElementType(0)) &&
+			isSupportedPairElem(ST->getElementType(1))) {
+			SmallVector<Type*, 8> Params;
+			Params.push_back(PtrTy);
+			for (Argument& A : F.args())
+				Params.push_back(A.getType());
+			FunctionType* CoreTy = FunctionType::get(Type::getVoidTy(Ctx), Params, false);
+			std::string CoreName = ("__vm_core_sret_" + F.getName()).str();
+			for (char& C : CoreName)
+				if (!std::isalnum((unsigned char)C) && C != '_') C = '_';
+			Function* Core = Function::Create(
+				CoreTy, GlobalValue::InternalLinkage, CoreName, &M);
+
+			// Clone into a temp with same signature, then rewrite rets to sret.
+			Function* Tmp = Function::Create(
+				F.getFunctionType(), GlobalValue::InternalLinkage,
+				CoreName + ".tmp", &M);
+			ValueToValueMapTy VMap;
+			auto TA = Tmp->arg_begin();
+			for (Argument& A : F.args()) {
+				TA->setName(A.getName());
+				VMap[&A] = &*TA++;
+			}
+			SmallVector<ReturnInst*, 8> Returns;
+			CloneFunctionInto(Tmp, &F, VMap,
+				CloneFunctionChangeType::LocalChangesOnly, Returns);
+
+			Argument* SretArg = Core->getArg(0);
+			SretArg->setName("sret");
+			{
+				ValueToValueMapTy VMap2;
+				auto CA = Core->arg_begin();
+				++CA; // skip sret
+				for (Argument& A : Tmp->args()) {
+					CA->setName(A.getName());
+					VMap2[&A] = &*CA++;
+				}
+				SmallVector<ReturnInst*, 8> Returns2;
+				CloneFunctionInto(Core, Tmp, VMap2,
+					CloneFunctionChangeType::LocalChangesOnly, Returns2);
+			}
+			Tmp->eraseFromParent();
+			finalizeInternalHelper(Core);
+			// CloneFunctionInto replaced param/ret attrs — drop ret attrs
+			// cloned from value-returning Tmp onto void Core; restore sret.
+			if (AttributeSet RAS = Core->getAttributes().getRetAttrs();
+				RAS.hasAttributes()) {
+				AttributeMask AM;
+				for (Attribute A : RAS)
+					AM.addAttribute(A);
+				Core->removeRetAttrs(AM);
+			}
+			Core->addParamAttr(0, Attribute::getWithStructRetType(Ctx, ST));
+
+			// Rewrite returns in Core: field stores to sret, ret void.
+			const DataLayout& DL0 = M.getDataLayout();
+			const StructLayout* SL0 = DL0.getStructLayout(ST);
+			SmallVector<ReturnInst*, 8> CoreRets;
+			for (BasicBlock& BB : *Core)
+				if (auto* RI = dyn_cast<ReturnInst>(BB.getTerminator()))
+					CoreRets.push_back(RI);
+			for (ReturnInst* RI : CoreRets) {
+				IRBuilder<> RB(RI);
+				if (Value* RV = RI->getReturnValue()) {
+					for (unsigned Idx = 0; Idx < 2; ++Idx) {
+						Value* Field = RB.CreateExtractValue(RV, Idx, "sret.ev");
+						Type* FT = ST->getElementType(Idx);
+						uint64_t Off = SL0->getElementOffset(Idx);
+						Value* Ptr = Off
+							? RB.CreateGEP(I8Ty, SretArg, RB.getInt64(Off), "sret.p")
+							: SretArg;
+						if (FT->isPointerTy() || FT->isIntegerTy(64)) {
+							RB.CreateStore(Field, Ptr);
+						} else {
+							unsigned W = FT->getIntegerBitWidth();
+							Type* StTy = (W <= 8) ? I8Ty : (W <= 16) ? I16Ty : I32Ty;
+							Value* SV = Field;
+							if (SV->getType() != StTy)
+								SV = RB.CreateZExtOrTrunc(SV, StTy, "sret.tr");
+							RB.CreateStore(SV, Ptr);
+						}
+					}
+				}
+				RB.CreateRetVoid();
+				RI->eraseFromParent();
+			}
+
+			DebugLoc ShellDL = captureShellDebugLoc();
+			LLVM_DEBUG(dbgs() << "[vm] odd-pair-ret auto-split '" << F.getName()
+				<< "' → core '" << Core->getName() << "'\n");
+			if (!virtualizeCore(Core)) {
+				Core->eraseFromParent();
+				return false;
+			}
+
+			wipeBody(F);
+			BasicBlock* Entry = BasicBlock::Create(Ctx, "entry", &F);
+			IRBuilder<> B(Entry);
+			if (ShellDL)
+				B.SetCurrentDebugLocation(ShellDL);
+			AllocaInst* TmpAgg = B.CreateAlloca(ST, nullptr, "sret.tmp");
+			SmallVector<Value*, 8> CallArgs;
+			CallArgs.push_back(TmpAgg);
+			for (Argument& A : F.args())
+				CallArgs.push_back(&A);
+			B.CreateCall(Core, CallArgs);
+			const DataLayout& DL = M.getDataLayout();
+			const StructLayout* SL = DL.getStructLayout(ST);
+			auto loadField = [&](unsigned Idx) -> Value* {
+				Type* FT = ST->getElementType(Idx);
+				uint64_t Off = SL->getElementOffset(Idx);
+				Value* Ptr = Off
+					? B.CreateGEP(I8Ty, TmpAgg, B.getInt64(Off), "sf.p")
+					: TmpAgg;
+				if (FT->isPointerTy())
+					return B.CreateLoad(PtrTy, Ptr, "sf.ld");
+				if (FT->isIntegerTy(64))
+					return B.CreateLoad(I64Ty, Ptr, "sf.ld");
+				unsigned W = FT->getIntegerBitWidth();
+				Type* LoadTy = (W <= 8) ? I8Ty : (W <= 16) ? I16Ty : I32Ty;
+				Value* V = B.CreateLoad(LoadTy, Ptr, "sf.ld");
+				if (V->getType() != FT)
+					V = B.CreateZExtOrTrunc(V, FT, "sf.x");
+				return V;
+			};
+			Value* V0 = loadField(0);
+			Value* V1 = loadField(1);
+			Value* Agg = UndefValue::get(ST);
+			Agg = B.CreateInsertValue(Agg, V0, 0, "sf.i0");
+			Agg = B.CreateInsertValue(Agg, V1, 1, "sf.i1");
+			B.CreateRet(Agg);
+			return true;
+		}
+	}
+
 	// Demote PHI nodes to memory
 	SmallVector<PHINode*, 32> Phis;
 	for (BasicBlock& BB : F)
@@ -51,19 +401,21 @@ bool VMImpl::run() {
 	//     Lower/strip intrinsics that clang emits at -O0 but the VM cannot
 	//      encode.  Three tiers:
 	//        A) Strip  — debug, lifetime, assume, expect, freeze: zero/identity.
-	//        B) Memory — memcpy/memset/memmove const size ≤ 1024: chunked
-	//                    i64/i32/i16/i8 load+store (or store-of-fill). memmove
-	//                    uses an entry alloca temp then two forward copies.
-	//        C) Float  — fabs, fmuladd, fma, minnum, maxnum, copysign:
-	//                    expand to FNeg/FMul/FAdd/FCmp/Select the VM handles.
-	//        D) Int    — abs; umul.with.overflow (i32/i64); ctpop/cttz (i32/i64):
-	//                    expand to IR the VM already encodes.
-	//      Also: load {i64,i64} with extractvalue-only users → two i64 loads.
-	//      Anything else stays and isize() will markUnsupported gracefully.
+	//        B) Memory — memcpy/memset/memmove const size ≤ 4096: chunked;
+	//                    else rewrite to libc @memcpy/@memset/@memmove.
+	//        C) Float  — fabs, fmuladd, fma, minnum, maxnum, copysign;
+	//                    ceil/floor/… → native thunks.
+	//        D) Int    — abs; umul.with.overflow; ctpop/cttz.
+	//        E) trap / ceil-family → native thunks (__vm_nat_*).
+	//           (va_* not thunked — must stay in the varargs frame.)
+	//      Also: aggregate loads, odd pair calls, switch/int legalize (below).
 	{
-		constexpr uint64_t kMemExpandMax = 1024;
+		constexpr uint64_t kMemExpandMax = 4096;
+		// Fully unrolling large copies blows the u8 vreg file; keep a small
+		// unroll budget and use a fixed-slot looped helper above it.
+		constexpr uint64_t kMemUnrollMax = 128;
 
-		auto emitMemChunks = [&](IRBuilder<>& B, Value* Dst, Value* Src,
+		auto emitMemChunksUnrolled = [&](IRBuilder<>& B, Value* Dst, Value* Src,
 			uint64_t Sz, uint8_t FillByte, bool IsSet) {
 			uint64_t Off = 0;
 			auto chunk = [&](Type* Ty, unsigned Bytes) {
@@ -89,6 +441,120 @@ bool VMImpl::run() {
 			chunk(I8Ty, 1);
 		};
 
+		// Looped memcpy/memset helpers — O(1) slots at the call site.
+		auto getOrCreateMemCpyLoop = [&]() -> Function* {
+			constexpr char Name[] = "__vm_memcpy_loop";
+			if (Function* E = M.getFunction(Name)) return E;
+			FunctionType* FT = FunctionType::get(Type::getVoidTy(Ctx),
+				{ PtrTy, PtrTy, I64Ty }, false);
+			Function* NF = Function::Create(FT, GlobalValue::InternalLinkage, Name, &M);
+			NF->addFnAttr(Attribute::NoInline);
+			NF->addFnAttr(Attribute::NoUnwind);
+			Argument* Dst = NF->getArg(0);
+			Argument* Src = NF->getArg(1);
+			Argument* N = NF->getArg(2);
+			BasicBlock* Entry = BasicBlock::Create(Ctx, "entry", NF);
+			BasicBlock* Loop = BasicBlock::Create(Ctx, "loop", NF);
+			BasicBlock* Rest = BasicBlock::Create(Ctx, "rest", NF);
+			BasicBlock* Done = BasicBlock::Create(Ctx, "done", NF);
+			IRBuilder<> EB(Entry);
+			Value* N64 = EB.CreateAnd(N, ConstantInt::get(I64Ty, ~7ull), "n64");
+			EB.CreateCondBr(EB.CreateICmpNE(N64, ConstantInt::get(I64Ty, 0)), Loop, Rest);
+			IRBuilder<> LB(Loop);
+			PHINode* I = LB.CreatePHI(I64Ty, 2, "i");
+			I->addIncoming(ConstantInt::get(I64Ty, 0), Entry);
+			Value* DP = LB.CreateGEP(I8Ty, Dst, I, "dp");
+			Value* SP = LB.CreateGEP(I8Ty, Src, I, "sp");
+			LB.CreateStore(LB.CreateLoad(I64Ty, SP, "ld"), DP);
+			Value* I2 = LB.CreateAdd(I, ConstantInt::get(I64Ty, 8), "i2");
+			I->addIncoming(I2, Loop);
+			LB.CreateCondBr(LB.CreateICmpULT(I2, N64), Loop, Rest);
+			IRBuilder<> RB(Rest);
+			PHINode* ROff = RB.CreatePHI(I64Ty, 2, "roff");
+			ROff->addIncoming(N64, Entry);
+			ROff->addIncoming(N64, Loop);
+			BasicBlock* BLoop = BasicBlock::Create(Ctx, "byte", NF);
+			RB.CreateCondBr(RB.CreateICmpULT(ROff, N), BLoop, Done);
+			IRBuilder<> BB(BLoop);
+			PHINode* BI = BB.CreatePHI(I64Ty, 2, "bi");
+			BI->addIncoming(ROff, Rest);
+			Value* BDP = BB.CreateGEP(I8Ty, Dst, BI, "bdp");
+			Value* BSP = BB.CreateGEP(I8Ty, Src, BI, "bsp");
+			BB.CreateStore(BB.CreateLoad(I8Ty, BSP, "bld"), BDP);
+			Value* BI2 = BB.CreateAdd(BI, ConstantInt::get(I64Ty, 1), "bi2");
+			BI->addIncoming(BI2, BLoop);
+			BB.CreateCondBr(BB.CreateICmpULT(BI2, N), BLoop, Done);
+			IRBuilder<> DB(Done);
+			DB.CreateRetVoid();
+			return NF;
+		};
+		auto getOrCreateMemSetLoop = [&]() -> Function* {
+			constexpr char Name[] = "__vm_memset_loop";
+			if (Function* E = M.getFunction(Name)) return E;
+			FunctionType* FT = FunctionType::get(Type::getVoidTy(Ctx),
+				{ PtrTy, I8Ty, I64Ty }, false);
+			Function* NF = Function::Create(FT, GlobalValue::InternalLinkage, Name, &M);
+			NF->addFnAttr(Attribute::NoInline);
+			NF->addFnAttr(Attribute::NoUnwind);
+			Argument* Dst = NF->getArg(0);
+			Argument* Val = NF->getArg(1);
+			Argument* N = NF->getArg(2);
+			BasicBlock* Entry = BasicBlock::Create(Ctx, "entry", NF);
+			BasicBlock* Loop = BasicBlock::Create(Ctx, "loop", NF);
+			BasicBlock* Rest = BasicBlock::Create(Ctx, "rest", NF);
+			BasicBlock* Done = BasicBlock::Create(Ctx, "done", NF);
+			IRBuilder<> EB(Entry);
+			Value* Val64 = EB.CreateZExt(Val, I64Ty, "v64");
+			// splat byte into i64 pattern
+			Value* Pat = Val64;
+			Pat = EB.CreateOr(Pat, EB.CreateShl(Pat, ConstantInt::get(I64Ty, 8)));
+			Pat = EB.CreateOr(Pat, EB.CreateShl(Pat, ConstantInt::get(I64Ty, 16)));
+			Pat = EB.CreateOr(Pat, EB.CreateShl(Pat, ConstantInt::get(I64Ty, 32)));
+			Value* N64 = EB.CreateAnd(N, ConstantInt::get(I64Ty, ~7ull), "n64");
+			EB.CreateCondBr(EB.CreateICmpNE(N64, ConstantInt::get(I64Ty, 0)), Loop, Rest);
+			IRBuilder<> LB(Loop);
+			PHINode* I = LB.CreatePHI(I64Ty, 2, "i");
+			I->addIncoming(ConstantInt::get(I64Ty, 0), Entry);
+			Value* DP = LB.CreateGEP(I8Ty, Dst, I, "dp");
+			LB.CreateStore(Pat, DP);
+			Value* I2 = LB.CreateAdd(I, ConstantInt::get(I64Ty, 8), "i2");
+			I->addIncoming(I2, Loop);
+			LB.CreateCondBr(LB.CreateICmpULT(I2, N64), Loop, Rest);
+			IRBuilder<> RB(Rest);
+			PHINode* ROff = RB.CreatePHI(I64Ty, 2, "roff");
+			ROff->addIncoming(N64, Entry);
+			ROff->addIncoming(N64, Loop);
+			BasicBlock* BLoop = BasicBlock::Create(Ctx, "byte", NF);
+			RB.CreateCondBr(RB.CreateICmpULT(ROff, N), BLoop, Done);
+			IRBuilder<> BB(BLoop);
+			PHINode* BI = BB.CreatePHI(I64Ty, 2, "bi");
+			BI->addIncoming(ROff, Rest);
+			Value* BDP = BB.CreateGEP(I8Ty, Dst, BI, "bdp");
+			BB.CreateStore(Val, BDP);
+			Value* BI2 = BB.CreateAdd(BI, ConstantInt::get(I64Ty, 1), "bi2");
+			BI->addIncoming(BI2, BLoop);
+			BB.CreateCondBr(BB.CreateICmpULT(BI2, N), BLoop, Done);
+			IRBuilder<> DB(Done);
+			DB.CreateRetVoid();
+			return NF;
+		};
+
+		auto emitMemChunks = [&](IRBuilder<>& B, Value* Dst, Value* Src,
+			uint64_t Sz, uint8_t FillByte, bool IsSet) {
+			if (Sz <= kMemUnrollMax) {
+				emitMemChunksUnrolled(B, Dst, Src, Sz, FillByte, IsSet);
+				return;
+			}
+			if (IsSet) {
+				B.CreateCall(getOrCreateMemSetLoop(),
+					{ Dst, ConstantInt::get(I8Ty, FillByte),
+					  ConstantInt::get(I64Ty, Sz) });
+			} else {
+				B.CreateCall(getOrCreateMemCpyLoop(),
+					{ Dst, Src, ConstantInt::get(I64Ty, Sz) });
+			}
+		};
+
 		// Tier A: freeze → identity (covers freeze i32 and other legal SSA types).
 		{
 			SmallVector<FreezeInst*, 16> Freezes;
@@ -108,6 +574,41 @@ bool VMImpl::run() {
 				if (auto* CI = dyn_cast<CallInst>(&I))
 					if (auto* CF = CI->getCalledFunction(); CF && CF->isIntrinsic())
 						Intrinsics.push_back(CI);
+
+		// Native thunk: keep the intrinsic inside an internal helper so the
+		// VM emits a normal CALL and the LLVM backend lowers the intrinsic.
+		auto getOrCreateNatThunk = [&](Function* IntrF) -> Function* {
+			std::string Name = ("__vm_nat." + IntrF->getName()).str();
+			for (char& C : Name)
+				if (C == '.' || C == '@') C = '_';
+			if (Function* E = M.getFunction(Name))
+				return E;
+			FunctionType* FT = IntrF->getFunctionType();
+			Function* NF = Function::Create(FT, GlobalValue::InternalLinkage, Name, &M);
+			NF->addFnAttr(Attribute::NoInline);
+			NF->addFnAttr(Attribute::NoUnwind);
+			BasicBlock* BB = BasicBlock::Create(Ctx, "entry", NF);
+			IRBuilder<> TB(BB);
+			SmallVector<Value*, 4> Args;
+			for (Argument& A : NF->args())
+				Args.push_back(&A);
+			CallInst* IC = TB.CreateCall(FT, IntrF, Args);
+			if (FT->getReturnType()->isVoidTy())
+				TB.CreateRetVoid();
+			else
+				TB.CreateRet(IC);
+			return NF;
+		};
+
+		auto rewriteToNatThunk = [&](CallInst* CI) {
+			Function* Thunk = getOrCreateNatThunk(CI->getCalledFunction());
+			IRBuilder<> B(CI);
+			SmallVector<Value*, 4> Args(CI->args().begin(), CI->args().end());
+			CallInst* NC = B.CreateCall(Thunk, Args, CI->getName());
+			NC->setTailCall(CI->isTailCall());
+			CI->replaceAllUsesWith(NC);
+			CI->eraseFromParent();
+		};
 
 		for (CallInst* CI : Intrinsics) {
 			Intrinsic::ID IID = CI->getCalledFunction()->getIntrinsicID();
@@ -130,7 +631,7 @@ bool VMImpl::run() {
 			default: break;
 			}
 
-			//  Tier B: memcpy / memmove (≤1024 chunked)
+			//  Tier B: memcpy / memmove (≤4096 chunked, else libc)
 			if (IID == Intrinsic::memcpy || IID == Intrinsic::memmove) {
 				if (auto* SzC = dyn_cast<ConstantInt>(CI->getArgOperand(2))) {
 					uint64_t Sz = SzC->getZExtValue();
@@ -138,7 +639,6 @@ bool VMImpl::run() {
 						Value* Dst = CI->getArgOperand(0);
 						Value* Src = CI->getArgOperand(1);
 						if (IID == Intrinsic::memmove) {
-							// Overlap-safe: entry temp, then src→tmp→dst.
 							IRBuilder<> EB(&F.getEntryBlock(),
 								F.getEntryBlock().getFirstInsertionPt());
 							AllocaInst* Tmp = EB.CreateAlloca(
@@ -152,10 +652,18 @@ bool VMImpl::run() {
 						continue;
 					}
 				}
-				continue; // non-constant / too large → markUnsupported later
+				const char* Name = (IID == Intrinsic::memmove) ? "memmove" : "memcpy";
+				FunctionType* LTy = FunctionType::get(PtrTy, { PtrTy, PtrTy, I64Ty }, false);
+				FunctionCallee LC = M.getOrInsertFunction(Name, LTy);
+				Value* Sz = CI->getArgOperand(2);
+				if (!Sz->getType()->isIntegerTy(64))
+					Sz = B.CreateZExtOrTrunc(Sz, I64Ty, "mc.sz64");
+				B.CreateCall(LC, { CI->getArgOperand(0), CI->getArgOperand(1), Sz });
+				CI->eraseFromParent();
+				continue;
 			}
 
-			//  Tier B: memset (≤1024 chunked)
+			//  Tier B: memset (≤4096 chunked, else libc)
 			if (IID == Intrinsic::memset) {
 				auto* SzC = dyn_cast<ConstantInt>(CI->getArgOperand(2));
 				auto* ValC = dyn_cast<ConstantInt>(CI->getArgOperand(1));
@@ -168,6 +676,16 @@ bool VMImpl::run() {
 						continue;
 					}
 				}
+				FunctionType* LTy = FunctionType::get(PtrTy,
+					{ PtrTy, I32Ty, I64Ty }, false);
+				FunctionCallee LC = M.getOrInsertFunction("memset", LTy);
+				Value* Val = CI->getArgOperand(1);
+				Value* Val32 = B.CreateZExt(Val, I32Ty, "ms.v32");
+				Value* Sz = CI->getArgOperand(2);
+				if (!Sz->getType()->isIntegerTy(64))
+					Sz = B.CreateZExtOrTrunc(Sz, I64Ty, "ms.sz64");
+				B.CreateCall(LC, { CI->getArgOperand(0), Val32, Sz });
+				CI->eraseFromParent();
 				continue;
 			}
 
@@ -344,14 +862,731 @@ bool VMImpl::run() {
 				}
 			}
 
+			//  Tier E: trap / ceil family → native thunks.
+			//  va_* handled by auto-split at run() entry (native shell).
+			if (IID == Intrinsic::trap ||
+				IID == Intrinsic::ceil || IID == Intrinsic::floor ||
+				IID == Intrinsic::trunc || IID == Intrinsic::nearbyint ||
+				IID == Intrinsic::rint || IID == Intrinsic::round) {
+				rewriteToNatThunk(CI);
+				continue;
+			}
+
 			// Anything else: leave in place, isize() will markUnsupported.
 		}
 	}
 
-	// load {i64,i64} is not a VM slot type. When every use is extractvalue
-	// 0/1, split into two i64 loads and rewrite the extracts.
+	const DataLayout& DL = M.getDataLayout();
+
+	// Non-i32 switches: zext/trunc cond into i32 when cases fit; else icmp/br.
 	{
-		const DataLayout& DL = F.getParent()->getDataLayout();
+		SmallVector<SwitchInst*, 16> Switches;
+		for (BasicBlock& BB : F)
+			for (Instruction& I : BB)
+				if (auto* SI = dyn_cast<SwitchInst>(&I))
+					if (!SI->getCondition()->getType()->isIntegerTy(32))
+						Switches.push_back(SI);
+
+		for (SwitchInst* SI : Switches) {
+			Value* Cond = SI->getCondition();
+			Type* CT = Cond->getType();
+			if (!CT->isIntegerTy()) continue;
+			unsigned BW = CT->getIntegerBitWidth();
+			bool CasesFitI32 = true;
+			for (auto& C : SI->cases()) {
+				if (C.getCaseValue()->getValue().getSignificantBits() > 32) {
+					CasesFitI32 = false;
+					break;
+				}
+			}
+			IRBuilder<> B(SI);
+			if (BW < 32 || (BW > 32 && CasesFitI32)) {
+				Value* C32 = (BW < 32)
+					? B.CreateZExt(Cond, I32Ty, "sw.z")
+					: B.CreateTrunc(Cond, I32Ty, "sw.t");
+				auto* NSw = SwitchInst::Create(C32, SI->getDefaultDest(),
+					SI->getNumCases(), SI->getIterator());
+				for (auto& C : SI->cases())
+					NSw->addCase(
+						ConstantInt::get(cast<IntegerType>(I32Ty),
+							C.getCaseValue()->getZExtValue()),
+						C.getCaseSuccessor());
+				SI->eraseFromParent();
+				continue;
+			}
+			// icmp/br chain for wide case values
+			auto retargetPhis = [](BasicBlock* Succ, BasicBlock* From, BasicBlock* To) {
+				for (PHINode& Phi : Succ->phis()) {
+					for (unsigned i = 0, e = Phi.getNumIncomingValues(); i < e; ++i)
+						if (Phi.getIncomingBlock(i) == From)
+							Phi.setIncomingBlock(i, To);
+				}
+			};
+			BasicBlock* OrigBB = SI->getParent();
+			BasicBlock* DefBB = SI->getDefaultDest();
+			SmallVector<std::pair<ConstantInt*, BasicBlock*>, 8> Cases;
+			for (auto& C : SI->cases())
+				Cases.push_back({ C.getCaseValue(), C.getCaseSuccessor() });
+			SI->eraseFromParent();
+			BasicBlock* Fall = DefBB;
+			for (auto It = Cases.rbegin(); It != Cases.rend(); ++It) {
+				BasicBlock* CmpBB = BasicBlock::Create(Ctx, "sw.cmp", &F, Fall);
+				IRBuilder<> CB(CmpBB);
+				Value* Eq = CB.CreateICmpEQ(Cond, It->first, "sw.eq");
+				CB.CreateCondBr(Eq, It->second, Fall);
+				retargetPhis(It->second, OrigBB, CmpBB);
+				retargetPhis(Fall, OrigBB, CmpBB);
+				Fall = CmpBB;
+			}
+			IRBuilder<> OB(OrigBB);
+			OB.CreateBr(Fall);
+		}
+	}
+
+	// Odd-width ints (not 1/8/16/32/64).
+	//   Reads:  load → [lshr] → [and] → trunc/zext  → __vm_il_extract
+	//   RMW:    store or(and(load,clear), insert)     → __vm_il_deposit
+	//   ≤64 leftover trunc/load/and/or/shl/store      → masked i64 SSA
+	{
+		{
+			SmallVector<FreezeInst*, 8> FZ;
+			for (BasicBlock& BB : F)
+				for (Instruction& I : BB)
+					if (auto* FI = dyn_cast<FreezeInst>(&I))
+						FZ.push_back(FI);
+			for (FreezeInst* FI : FZ) {
+				FI->replaceAllUsesWith(FI->getOperand(0));
+				FI->eraseFromParent();
+			}
+		}
+		auto illegalInt = [&](Type* T) -> unsigned {
+			if (!T || !T->isIntegerTy()) return 0;
+			unsigned W = T->getIntegerBitWidth();
+			if (W == 1 || W == 8 || W == 16 || W == 32 || W == 64) return 0;
+			return W;
+		};
+		auto i64Mask = [&](unsigned W) -> Constant* {
+			assert(W > 0 && W <= 64);
+			uint64_t M = (W == 64) ? ~0ull : ((1ull << W) - 1ull);
+			return ConstantInt::get(I64Ty, M);
+		};
+		FunctionType* MemCpyTy = FunctionType::get(PtrTy, { PtrTy, PtrTy, I64Ty }, false);
+		FunctionCallee MemCpy = M.getOrInsertFunction("memcpy", MemCpyTy);
+
+		auto getOrCreateBfExtract = [&]() -> Function* {
+			constexpr char Name[] = "__vm_il_extract";
+			if (Function* E = M.getFunction(Name)) return E;
+			FunctionType* FT = FunctionType::get(I64Ty, { PtrTy, I64Ty, I64Ty }, false);
+			Function* NF = Function::Create(FT, GlobalValue::InternalLinkage, Name, &M);
+			NF->addFnAttr(Attribute::NoInline);
+			NF->addFnAttr(Attribute::NoUnwind);
+			Argument* Base = NF->getArg(0);
+			Argument* BitOff = NF->getArg(1);
+			Argument* BitWidth = NF->getArg(2);
+			BasicBlock* BB = BasicBlock::Create(Ctx, "entry", NF);
+			IRBuilder<> HB(BB);
+			AllocaInst* Tmp = HB.CreateAlloca(I64Ty, nullptr, "t");
+			HB.CreateStore(ConstantInt::get(I64Ty, 0), Tmp);
+			Value* ByteOff = HB.CreateUDiv(BitOff, ConstantInt::get(I64Ty, 8));
+			Value* Skip = HB.CreateURem(BitOff, ConstantInt::get(I64Ty, 8));
+			Value* Src = HB.CreateGEP(I8Ty, Base, ByteOff, "src");
+			HB.CreateCall(MemCpy, { Tmp, Src, ConstantInt::get(I64Ty, 8) });
+			Value* V = HB.CreateLoad(I64Ty, Tmp, "ld");
+			V = HB.CreateLShr(V, Skip, "sh");
+			Value* ShAmt = HB.CreateZExtOrTrunc(BitWidth, I64Ty);
+			Value* Mask = HB.CreateSub(
+				HB.CreateShl(ConstantInt::get(I64Ty, 1), ShAmt),
+				ConstantInt::get(I64Ty, 1), "msk");
+			Value* Is64 = HB.CreateICmpEQ(BitWidth, ConstantInt::get(I64Ty, 64));
+			Mask = HB.CreateSelect(Is64, ConstantInt::get(I64Ty, ~0ull), Mask);
+			HB.CreateRet(HB.CreateAnd(V, Mask, "m"));
+			return NF;
+		};
+		auto getOrCreateBfDeposit = [&]() -> Function* {
+			constexpr char Name[] = "__vm_il_deposit";
+			if (Function* E = M.getFunction(Name)) return E;
+			// void deposit(ptr base, i64 bitoff, i64 width, i64 val)
+			FunctionType* FT = FunctionType::get(Type::getVoidTy(Ctx),
+				{ PtrTy, I64Ty, I64Ty, I64Ty }, false);
+			Function* NF = Function::Create(FT, GlobalValue::InternalLinkage, Name, &M);
+			NF->addFnAttr(Attribute::NoInline);
+			NF->addFnAttr(Attribute::NoUnwind);
+			Argument* Base = NF->getArg(0);
+			Argument* BitOff = NF->getArg(1);
+			Argument* BitWidth = NF->getArg(2);
+			Argument* Val = NF->getArg(3);
+			BasicBlock* BB = BasicBlock::Create(Ctx, "entry", NF);
+			IRBuilder<> HB(BB);
+			AllocaInst* Tmp = HB.CreateAlloca(I64Ty, nullptr, "t");
+			HB.CreateStore(ConstantInt::get(I64Ty, 0), Tmp);
+			Value* ByteOff = HB.CreateUDiv(BitOff, ConstantInt::get(I64Ty, 8));
+			Value* Skip = HB.CreateURem(BitOff, ConstantInt::get(I64Ty, 8));
+			Value* Dst = HB.CreateGEP(I8Ty, Base, ByteOff, "dst");
+			HB.CreateCall(MemCpy, { Tmp, Dst, ConstantInt::get(I64Ty, 8) });
+			Value* Cur = HB.CreateLoad(I64Ty, Tmp, "ld");
+			Value* ShAmt = HB.CreateZExtOrTrunc(BitWidth, I64Ty);
+			Value* Ones = HB.CreateSub(
+				HB.CreateShl(ConstantInt::get(I64Ty, 1), ShAmt),
+				ConstantInt::get(I64Ty, 1));
+			Value* Is64 = HB.CreateICmpEQ(BitWidth, ConstantInt::get(I64Ty, 64));
+			Ones = HB.CreateSelect(Is64, ConstantInt::get(I64Ty, ~0ull), Ones);
+			Value* Field = HB.CreateShl(Ones, Skip, "fld");
+			Value* Cleared = HB.CreateAnd(Cur, HB.CreateNot(Field), "clr");
+			Value* Ins = HB.CreateAnd(Val, Ones, "ins");
+			Ins = HB.CreateShl(Ins, Skip, "inssh");
+			HB.CreateStore(HB.CreateOr(Cleared, Ins, "m"), Tmp);
+			HB.CreateCall(MemCpy, { Dst, Tmp, ConstantInt::get(I64Ty, 8) });
+			HB.CreateRetVoid();
+			return NF;
+		};
+		Function* BfExtractFn = getOrCreateBfExtract();
+		Function* BfDepositFn = getOrCreateBfDeposit();
+		auto extractBits = [&](IRBuilder<>& B, Value* Base, unsigned BitOff,
+			unsigned BitWidth) -> Value* {
+			return B.CreateCall(BfExtractFn,
+				{ Base, ConstantInt::get(I64Ty, BitOff),
+				  ConstantInt::get(I64Ty, BitWidth) }, "il.x");
+		};
+		auto depositBits = [&](IRBuilder<>& B, Value* Base, unsigned BitOff,
+			unsigned BitWidth, Value* Val) {
+			if (!Val->getType()->isIntegerTy(64))
+				Val = B.CreateZExtOrTrunc(Val, I64Ty, "il.dv");
+			B.CreateCall(BfDepositFn,
+				{ Base, ConstantInt::get(I64Ty, BitOff),
+				  ConstantInt::get(I64Ty, BitWidth), Val });
+		};
+
+		AllocaInst* LdScratch = nullptr;
+		AllocaInst* StScratch = nullptr;
+		auto entryAllocaI64 = [&](AllocaInst*& Slot, const char* Name) -> AllocaInst* {
+			if (!Slot) {
+				IRBuilder<> EB(&F.getEntryBlock(),
+					F.getEntryBlock().getFirstInsertionPt());
+				Slot = EB.CreateAlloca(I64Ty, nullptr, Name);
+			}
+			return Slot;
+		};
+
+		// Contiguous zero-bits in Clear → field (Off, Width). Fail if non-contig.
+		auto fieldFromClear = [&](const APInt& Clear, unsigned SrcW,
+			unsigned& Off, unsigned& Width) -> bool {
+			APInt Field = (~Clear).zextOrTrunc(SrcW);
+			if (Field.isZero()) return false;
+			Off = Field.countr_zero();
+			// lshr — ashr sign-fills when MSB is in the field and inflates Ones.
+			unsigned Ones = Field.lshr(Off).countr_one();
+			if (Ones == 0 || Off + Ones > SrcW) return false;
+			APInt Expect = APInt::getLowBitsSet(SrcW, Ones).shl(Off);
+			if (Field != Expect) return false;
+			Width = Ones;
+			return Width <= 64;
+		};
+
+		// Peel insert tree → (ValI64, BitOff, Width); Val already shifted to field.
+		// IP = insertion point (Store); Ins may be a ConstantInt.
+		auto peelInsert = [&](Value* Ins, Instruction* IP, unsigned SrcW,
+			unsigned& BitOff, unsigned& Width, Value*& ValI64) -> bool {
+			BitOff = 0;
+			Width = 0;
+			ValI64 = nullptr;
+			Value* V = Ins;
+			unsigned Sh = 0;
+			if (auto* BO = dyn_cast<BinaryOperator>(V)) {
+				if (BO->getOpcode() == Instruction::Shl) {
+					auto* CI = dyn_cast<ConstantInt>(BO->getOperand(1));
+					if (!CI) return false;
+					Sh = (unsigned)CI->getZExtValue();
+					V = BO->getOperand(0);
+				}
+			}
+			unsigned MaskW = SrcW;
+			if (auto* BO = dyn_cast<BinaryOperator>(V)) {
+				if (BO->getOpcode() == Instruction::And) {
+					Value* Other = BO->getOperand(0);
+					Value* MaskV = BO->getOperand(1);
+					if (!isa<ConstantInt>(MaskV))
+						std::swap(Other, MaskV);
+					auto* MCI = dyn_cast<ConstantInt>(MaskV);
+					if (!MCI) return false;
+					MaskW = MCI->getValue().getActiveBits();
+					if (MaskW == 0) MaskW = 1;
+					V = Other;
+				}
+			}
+			IRBuilder<> B(IP);
+			if (auto* TI = dyn_cast<TruncInst>(V)) {
+				Value* Src = TI->getOperand(0);
+				if (!Src->getType()->isIntegerTy()) return false;
+				if (Src->getType()->getIntegerBitWidth() > 64) return false;
+				ValI64 = Src;
+				if (!ValI64->getType()->isIntegerTy(64))
+					ValI64 = B.CreateZExtOrTrunc(ValI64, I64Ty, "il.ins");
+				if (MaskW < 64)
+					ValI64 = B.CreateAnd(ValI64, i64Mask(MaskW), "il.insm");
+			} else if (auto* ZI = dyn_cast<ZExtInst>(V)) {
+				// zext i64 %v to iN  (bitfield insert into >64)
+				Value* Src = ZI->getOperand(0);
+				if (!Src->getType()->isIntegerTy()) return false;
+				if (Src->getType()->getIntegerBitWidth() > 64) return false;
+				ValI64 = Src;
+				if (!ValI64->getType()->isIntegerTy(64))
+					ValI64 = B.CreateZExtOrTrunc(ValI64, I64Ty, "il.ins");
+				if (MaskW < 64)
+					ValI64 = B.CreateAnd(ValI64, i64Mask(MaskW), "il.insm");
+			} else if (auto* CI = dyn_cast<ConstantInt>(V)) {
+				// Bare const (no and-mask): Width 0 → Pass 1 keeps clear-field width.
+				ValI64 = ConstantInt::get(I64Ty, CI->getZExtValue());
+				if (MaskW == SrcW)
+					MaskW = 0;
+			} else if (V->getType()->isIntegerTy(64)) {
+				ValI64 = V;
+			} else if (illegalInt(V->getType()) &&
+				V->getType()->getIntegerBitWidth() <= 64) {
+				ValI64 = B.CreateZExtOrTrunc(V, I64Ty, "il.ins");
+			} else
+				return false;
+			BitOff = Sh;
+			Width = MaskW;
+			if (Width == 0) return true; // inherit clear width
+			if (Width > 64 || BitOff + Width > SrcW) return false;
+			return true;
+		};
+
+		// Pass 1: bitfield RMW  store or(and(load,clear), insert) → deposit
+		{
+			SmallVector<StoreInst*, 16> Stores;
+			for (BasicBlock& BB : F)
+				for (Instruction& I : BB)
+					if (auto* SI = dyn_cast<StoreInst>(&I))
+						if (illegalInt(SI->getValueOperand()->getType()))
+							Stores.push_back(SI);
+			for (StoreInst* SI : Stores) {
+				if (!SI->getParent()) continue;
+				unsigned W = illegalInt(SI->getValueOperand()->getType());
+				if (!W) continue;
+				auto* Or = dyn_cast<BinaryOperator>(SI->getValueOperand());
+				if (!Or || Or->getOpcode() != Instruction::Or) continue;
+				Value* A = Or->getOperand(0);
+				Value* Bv = Or->getOperand(1);
+				auto* AndClr = dyn_cast<BinaryOperator>(A);
+				Value* Ins = Bv;
+				if (!AndClr || AndClr->getOpcode() != Instruction::And) {
+					AndClr = dyn_cast<BinaryOperator>(Bv);
+					Ins = A;
+				}
+				if (!AndClr || AndClr->getOpcode() != Instruction::And) continue;
+				Value* LdV = AndClr->getOperand(0);
+				Value* ClrV = AndClr->getOperand(1);
+				if (!isa<LoadInst>(LdV))
+					std::swap(LdV, ClrV);
+				auto* LI = dyn_cast<LoadInst>(LdV);
+				auto* ClrCI = dyn_cast<ConstantInt>(ClrV);
+				if (!LI || !ClrCI) continue;
+				if (LI->getPointerOperand() != SI->getPointerOperand()) continue;
+				unsigned Off = 0, Width = 0;
+				if (!fieldFromClear(ClrCI->getValue(), W, Off, Width)) continue;
+				unsigned InsOff = 0, InsW = 0;
+				Value* ValI64 = nullptr;
+				if (!peelInsert(Ins, SI, W, InsOff, InsW, ValI64)) continue;
+				if (InsW == 0) {
+					// Bare const already positioned; pull field from absolute bits.
+					auto* CI = dyn_cast<ConstantInt>(Ins);
+					if (!CI) continue;
+					APInt Bits = CI->getValue().zextOrTrunc(W).lshr(Off);
+					uint64_t M = Width == 64 ? ~uint64_t(0)
+						: ((uint64_t(1) << Width) - 1);
+					ValI64 = ConstantInt::get(I64Ty, Bits.getZExtValue() & M);
+				} else {
+					if (InsOff != Off) continue;
+					if (InsW > Width) continue;
+					Width = InsW;
+				}
+				IRBuilder<> B(SI);
+				depositBits(B, SI->getPointerOperand(), Off, Width, ValI64);
+				// Erase the whole RMW tree so dead odd-typed ops cannot
+				// reach the emitter (or Pass 3 materialize).
+				SmallVector<Instruction*, 8> Kill;
+				auto track = [&](Value* V) {
+					if (auto* I = dyn_cast<Instruction>(V))
+						Kill.push_back(I);
+				};
+				track(SI);
+				track(Or);
+				track(AndClr);
+				track(LI);
+				track(Ins);
+				if (auto* BO = dyn_cast<BinaryOperator>(Ins)) {
+					track(BO->getOperand(0));
+					track(BO->getOperand(1));
+					for (Value* Op : { BO->getOperand(0), BO->getOperand(1) }) {
+						if (auto* I2 = dyn_cast<BinaryOperator>(Op)) {
+							track(I2->getOperand(0));
+							track(I2->getOperand(1));
+						} else if (auto* C = dyn_cast<CastInst>(Op))
+							track(C);
+					}
+				} else if (auto* C = dyn_cast<CastInst>(Ins))
+					track(C);
+				SI->eraseFromParent();
+				// Drop uses then delete bottom-up by emptying users.
+				for (int Pass = 0; Pass < 6; ++Pass) {
+					for (Instruction* I : Kill) {
+						if (!I->getParent()) continue;
+						if (I->use_empty() && !isa<StoreInst>(I))
+							I->eraseFromParent();
+					}
+				}
+			}
+		}
+
+		// Pass 2: bitfield reads  load → [lshr] → [and] → trunc/zext
+		{
+			SmallVector<LoadInst*, 16> Loads;
+			for (BasicBlock& BB : F)
+				for (Instruction& I : BB)
+					if (auto* LI = dyn_cast<LoadInst>(&I))
+						if (illegalInt(LI->getType()) && LI->getParent())
+							Loads.push_back(LI);
+
+			for (LoadInst* LI : Loads) {
+				if (!LI->getParent() || LI->user_empty()) continue;
+				struct FieldExt {
+					Instruction* Anchor; // lshr or and or load-user start
+					Instruction* KillLShr;
+					Instruction* KillAnd;
+					Instruction* KillOut; // trunc or zext
+					Type* OutTy;
+					unsigned ShAmt;
+					unsigned OutBits;
+				};
+				SmallVector<FieldExt, 8> Fields;
+				bool Ok = true;
+				for (User* LU : LI->users()) {
+					FieldExt FE{};
+					FE.KillLShr = nullptr;
+					FE.KillAnd = nullptr;
+					FE.KillOut = nullptr;
+					FE.OutTy = nullptr;
+					FE.ShAmt = 0;
+					FE.OutBits = 0;
+					Value* Cur = LU;
+					FE.Anchor = dyn_cast<Instruction>(LU);
+					if (!FE.Anchor) { Ok = false; break; }
+
+					if (auto* Sh = dyn_cast<BinaryOperator>(Cur)) {
+						if (Sh->getOpcode() == Instruction::LShr ||
+							Sh->getOpcode() == Instruction::AShr) {
+							auto* ShCI = dyn_cast<ConstantInt>(Sh->getOperand(1));
+							if (!ShCI || Sh->getOperand(0) != LI) {
+								Ok = false; break;
+							}
+							FE.ShAmt = (unsigned)ShCI->getZExtValue();
+							FE.KillLShr = Sh;
+							if (!Sh->hasOneUse()) { Ok = false; break; }
+							Cur = *Sh->user_begin();
+						}
+					}
+
+					if (auto* AI = dyn_cast<BinaryOperator>(Cur)) {
+						if (AI->getOpcode() == Instruction::And) {
+							Value* MaskV = AI->getOperand(0) == (FE.KillLShr
+								? (Value*)FE.KillLShr : (Value*)LI)
+								? AI->getOperand(1) : AI->getOperand(0);
+							auto* MCI = dyn_cast<ConstantInt>(MaskV);
+							Value* Other = MaskV == AI->getOperand(0)
+								? AI->getOperand(1) : AI->getOperand(0);
+							Value* Expect = FE.KillLShr ? (Value*)FE.KillLShr : (Value*)LI;
+							if (!MCI || Other != Expect) { Ok = false; break; }
+							FE.OutBits = MCI->getValue().getActiveBits();
+							if (FE.OutBits == 0) FE.OutBits = 1;
+							if (FE.OutBits > 64) { Ok = false; break; }
+							FE.KillAnd = AI;
+							if (!AI->hasOneUse()) { Ok = false; break; }
+							Cur = *AI->user_begin();
+						}
+					}
+
+					if (auto* TI = dyn_cast<TruncInst>(Cur)) {
+						FE.OutTy = TI->getType();
+						if (!FE.OutBits)
+							FE.OutBits = FE.OutTy->getIntegerBitWidth();
+						FE.KillOut = TI;
+					} else if (auto* ZI = dyn_cast<ZExtInst>(Cur)) {
+						FE.OutTy = ZI->getType();
+						if (!FE.OutBits) {
+							// zext of shifted value: width = srcW - shamt
+							unsigned SW = illegalInt(LI->getType());
+							FE.OutBits = SW > FE.ShAmt ? SW - FE.ShAmt : 1;
+							if (FE.OutBits > 64) FE.OutBits = 64;
+						}
+						FE.KillOut = ZI;
+					} else {
+						Ok = false; break;
+					}
+					if (!FE.OutTy || FE.OutBits == 0 || FE.OutBits > 64) {
+						Ok = false; break;
+					}
+					Fields.push_back(FE);
+				}
+				if (!Ok || Fields.empty()) continue;
+				Value* Base = LI->getPointerOperand();
+				for (FieldExt& FE : Fields) {
+					IRBuilder<> EB(FE.Anchor);
+					Value* R = extractBits(EB, Base, FE.ShAmt, FE.OutBits);
+					Value* Out = R;
+					if (FE.OutTy != I64Ty)
+						Out = EB.CreateZExtOrTrunc(R, FE.OutTy, "il.fld");
+					FE.KillOut->replaceAllUsesWith(Out);
+					FE.KillOut->eraseFromParent();
+					if (FE.KillAnd) FE.KillAnd->eraseFromParent();
+					if (FE.KillLShr) FE.KillLShr->eraseFromParent();
+				}
+				if (LI->use_empty())
+					LI->eraseFromParent();
+			}
+		}
+
+		// Pass 3: ≤64 odd SSA → masked i64 (covers leftover trunc/and/or/shl/store)
+		{
+			DenseMap<Value*, Value*> I64Of;
+			DenseSet<Value*> MatInProg;
+			std::function<Value*(Value*)> materialize;
+			std::function<bool(Value*, Value*, unsigned)> rewriteUsers;
+
+			auto promotePeer = [&](IRBuilder<>& B, Value* Peer) -> Value* {
+				if (auto* C = dyn_cast<ConstantInt>(Peer))
+					return ConstantInt::get(I64Ty, C->getZExtValue());
+				if (Value* Cached = I64Of.lookup(Peer))
+					return Cached;
+				if (unsigned PW = illegalInt(Peer->getType())) {
+					if (PW > 64) return nullptr;
+					return materialize(Peer);
+				}
+				if (Peer->getType()->isIntegerTy(64))
+					return Peer;
+				if (Peer->getType()->isIntegerTy())
+					return B.CreateZExtOrTrunc(Peer, I64Ty, "il.pr");
+				return nullptr;
+			};
+
+			rewriteUsers = [&](Value* Old, Value* NewI64, unsigned OldW) -> bool {
+				I64Of[Old] = NewI64;
+				SmallVector<User*, 8> Users(Old->user_begin(), Old->user_end());
+				for (User* U : Users) {
+					if (auto* SI = dyn_cast<StoreInst>(U)) {
+						if (SI->getValueOperand() != Old) return false;
+						IRBuilder<> SB(SI);
+						AllocaInst* Tmp = entryAllocaI64(StScratch, "il.st");
+						SB.CreateStore(NewI64, Tmp);
+						SB.CreateCall(MemCpy, { SI->getPointerOperand(), Tmp,
+							ConstantInt::get(I64Ty, (OldW + 7) / 8) });
+						SI->eraseFromParent();
+						continue;
+					}
+					if (auto* TI = dyn_cast<TruncInst>(U)) {
+						IRBuilder<> TB(TI);
+						unsigned DW = TI->getType()->getIntegerBitWidth();
+						if (illegalInt(TI->getType()) && DW <= 64) {
+							Value* R = TB.CreateAnd(NewI64, i64Mask(DW), "il.tr");
+							if (!rewriteUsers(TI, R, DW)) return false;
+							if (TI->use_empty()) TI->eraseFromParent();
+							continue;
+						}
+						if (!(DW == 1 || DW == 8 || DW == 16 || DW == 32 || DW == 64))
+							return false;
+						Value* R = NewI64;
+						if (DW < 64)
+							R = TB.CreateAnd(NewI64, i64Mask(DW), "il.tr");
+						if (!TI->getType()->isIntegerTy(64))
+							R = TB.CreateZExtOrTrunc(R, TI->getType(), "il.trty");
+						TI->replaceAllUsesWith(R);
+						TI->eraseFromParent();
+						continue;
+					}
+					if (auto* ZI = dyn_cast<ZExtInst>(U)) {
+						IRBuilder<> ZB(ZI);
+						unsigned DW = ZI->getType()->getIntegerBitWidth();
+						if (illegalInt(ZI->getType()) && DW <= 64) {
+							Value* R = ZB.CreateAnd(NewI64, i64Mask(OldW), "il.ze");
+							if (!rewriteUsers(ZI, R, DW)) return false;
+							if (ZI->use_empty()) ZI->eraseFromParent();
+							continue;
+						}
+						Value* Out = NewI64;
+						if (!ZI->getType()->isIntegerTy(64))
+							Out = ZB.CreateZExtOrTrunc(NewI64, ZI->getType(), "il.zety");
+						ZI->replaceAllUsesWith(Out);
+						ZI->eraseFromParent();
+						continue;
+					}
+					if (auto* XI = dyn_cast<SExtInst>(U)) {
+						IRBuilder<> XB(XI);
+						Value* Sh = ConstantInt::get(I64Ty, 64 - OldW);
+						Value* Sext64 = XB.CreateAShr(
+							XB.CreateShl(NewI64, Sh), Sh, "il.se");
+						unsigned DW = XI->getType()->getIntegerBitWidth();
+						if (illegalInt(XI->getType()) && DW <= 64) {
+							Value* R = XB.CreateAnd(Sext64, i64Mask(DW), "il.sem");
+							if (!rewriteUsers(XI, R, DW)) return false;
+							if (XI->use_empty()) XI->eraseFromParent();
+							continue;
+						}
+						Value* Out = Sext64;
+						if (!XI->getType()->isIntegerTy(64))
+							Out = XB.CreateZExtOrTrunc(Sext64, XI->getType(), "il.sety");
+						XI->replaceAllUsesWith(Out);
+						XI->eraseFromParent();
+						continue;
+					}
+					if (auto* BO = dyn_cast<BinaryOperator>(U)) {
+						unsigned Op = BO->getOpcode();
+						if (Op != Instruction::And && Op != Instruction::Or &&
+							Op != Instruction::Xor && Op != Instruction::Shl &&
+							Op != Instruction::LShr && Op != Instruction::AShr)
+							return false;
+						if (Value* Cached = I64Of.lookup(BO)) {
+							(void)Cached;
+							continue;
+						}
+						if (MatInProg.contains(BO)) {
+							// Peer owns this BO; detach Old.
+							if (BO->getOperand(0) == Old)
+								BO->setOperand(0, UndefValue::get(Old->getType()));
+							else if (BO->getOperand(1) == Old)
+								BO->setOperand(1, UndefValue::get(Old->getType()));
+							continue;
+						}
+						IRBuilder<> BB(BO);
+						Value* Peer = BO->getOperand(0) == Old
+							? BO->getOperand(1) : BO->getOperand(0);
+						Value* PeerI64 = nullptr;
+						Value* R = nullptr;
+						if (Op == Instruction::LShr || Op == Instruction::AShr ||
+							Op == Instruction::Shl) {
+							auto* CI = dyn_cast<ConstantInt>(Peer);
+							if (!CI) return false;
+							unsigned ShAmt = (unsigned)CI->getZExtValue();
+							Value* ShC = ConstantInt::get(I64Ty, ShAmt);
+							if (Op == Instruction::LShr)
+								R = BB.CreateLShr(NewI64, ShC, "il.lshr");
+							else if (Op == Instruction::AShr) {
+								Value* S = BB.CreateAShr(
+									BB.CreateShl(NewI64, ConstantInt::get(I64Ty, 64 - OldW)),
+									ConstantInt::get(I64Ty, 64 - OldW));
+								R = BB.CreateAShr(S, ShC, "il.ashr");
+							} else
+								R = BB.CreateShl(NewI64, ShC, "il.shl");
+							unsigned ResW = illegalInt(BO->getType());
+							if (!ResW) ResW = OldW;
+							if (ResW <= 64)
+								R = BB.CreateAnd(R, i64Mask(std::min(ResW, 64u)), "il.shnm");
+						} else {
+							PeerI64 = promotePeer(BB, Peer);
+							if (!PeerI64) return false;
+							if (Op == Instruction::And)
+								R = BB.CreateAnd(NewI64, PeerI64, "il.and");
+							else if (Op == Instruction::Or)
+								R = BB.CreateOr(NewI64, PeerI64, "il.or");
+							else
+								R = BB.CreateXor(NewI64, PeerI64, "il.xor");
+							unsigned ResW = illegalInt(BO->getType());
+							if (!ResW) ResW = OldW;
+							if (ResW <= 64)
+								R = BB.CreateAnd(R, i64Mask(std::min(ResW, 64u)), "il.bom");
+						}
+						unsigned ResW = illegalInt(BO->getType());
+						if (!ResW) {
+							// Result became legal somehow — cast down
+							Value* Out = R;
+							if (BO->getType() != I64Ty)
+								Out = BB.CreateZExtOrTrunc(R, BO->getType(), "il.boty");
+							BO->replaceAllUsesWith(Out);
+							BO->eraseFromParent();
+							continue;
+						}
+						if (ResW > 64) return false;
+						if (!rewriteUsers(BO, R, ResW)) return false;
+						if (BO->use_empty()) BO->eraseFromParent();
+						continue;
+					}
+					return false;
+				}
+				return true;
+			};
+
+			materialize = [&](Value* V) -> Value* {
+				if (Value* Cached = I64Of.lookup(V)) return Cached;
+				unsigned W = illegalInt(V->getType());
+				if (!W || W > 64) return nullptr;
+				if (!MatInProg.insert(V).second)
+					return I64Of.lookup(V);
+				IRBuilder<> B(cast<Instruction>(V));
+				Value* R = nullptr;
+				if (auto* LI = dyn_cast<LoadInst>(V)) {
+					AllocaInst* Tmp = entryAllocaI64(LdScratch, "il.ldtmp");
+					B.CreateStore(ConstantInt::get(I64Ty, 0), Tmp);
+					B.CreateCall(MemCpy, { Tmp, LI->getPointerOperand(),
+						ConstantInt::get(I64Ty, (W + 7) / 8) });
+					R = B.CreateAnd(B.CreateLoad(I64Ty, Tmp, "il.ld"),
+						i64Mask(W), "il.ldm");
+				} else if (auto* TI = dyn_cast<TruncInst>(V)) {
+					Value* Src = TI->getOperand(0);
+					if (!Src->getType()->isIntegerTy(64))
+						Src = B.CreateZExtOrTrunc(Src, I64Ty, "il.s64");
+					R = B.CreateAnd(Src, i64Mask(W), "il.trunc");
+				} else if (auto* ZI = dyn_cast<ZExtInst>(V)) {
+					Value* Src = ZI->getOperand(0);
+					if (unsigned SW = illegalInt(Src->getType())) {
+						if (SW > 64) { MatInProg.erase(V); return nullptr; }
+						Src = materialize(Src);
+						if (!Src) { MatInProg.erase(V); return nullptr; }
+					} else if (!Src->getType()->isIntegerTy(64))
+						Src = B.CreateZExtOrTrunc(Src, I64Ty, "il.zs64");
+					R = B.CreateAnd(Src, i64Mask(W), "il.zext");
+				} else if (auto* XI = dyn_cast<SExtInst>(V)) {
+					Value* Src = XI->getOperand(0);
+					unsigned SrcW = Src->getType()->getIntegerBitWidth();
+					if (unsigned SW = illegalInt(Src->getType())) {
+						if (SW > 64) { MatInProg.erase(V); return nullptr; }
+						Src = materialize(Src);
+						if (!Src) { MatInProg.erase(V); return nullptr; }
+						SrcW = SW;
+					} else if (!Src->getType()->isIntegerTy(64))
+						Src = B.CreateZExtOrTrunc(Src, I64Ty, "il.ss64");
+					Value* Sh = ConstantInt::get(I64Ty, 64 - SrcW);
+					R = B.CreateAnd(
+						B.CreateAShr(B.CreateShl(Src, Sh), Sh, "il.sext"),
+						i64Mask(W), "il.sextm");
+				} else {
+					MatInProg.erase(V);
+					return nullptr;
+				}
+				I64Of[V] = R;
+				MatInProg.erase(V);
+				if (!rewriteUsers(V, R, W)) return nullptr;
+				if (auto* I = dyn_cast<Instruction>(V))
+					if (I->use_empty()) I->eraseFromParent();
+				return R;
+			};
+
+			SmallVector<Instruction*, 32> Roots;
+			for (BasicBlock& BB : F)
+				for (Instruction& I : BB) {
+					unsigned W = illegalInt(I.getType());
+					if (!W || W > 64) continue;
+					if (isa<LoadInst>(&I) || isa<TruncInst>(&I) ||
+						isa<ZExtInst>(&I) || isa<SExtInst>(&I))
+						Roots.push_back(&I);
+				}
+			for (Instruction* Root : Roots) {
+				if (!Root->getParent() || Root->use_empty()) continue;
+				materialize(Root);
+			}
+		}
+	}
+
+	// 2-field aggregate loads with extractvalue-only users → scalar loads.
+	{
 		SmallVector<LoadInst*, 16> AggLoads;
 		for (BasicBlock& BB : F)
 			for (Instruction& I : BB) {
@@ -359,39 +1594,221 @@ bool VMImpl::run() {
 				if (!LI) continue;
 				auto* ST = dyn_cast<StructType>(LI->getType());
 				if (!ST || ST->getNumElements() != 2) continue;
-				if (!ST->getElementType(0)->isIntegerTy(64) ||
-					!ST->getElementType(1)->isIntegerTy(64))
+				if (!isSupportedPairElem(ST->getElementType(0)) ||
+					!isSupportedPairElem(ST->getElementType(1)))
 					continue;
 				bool Ok = !LI->user_empty();
 				for (User* U : LI->users()) {
-					auto* EV = dyn_cast<ExtractValueInst>(U);
-					if (!EV || EV->getNumIndices() != 1 || EV->getIndices()[0] > 1) {
-						Ok = false;
-						break;
+					if (auto* EV = dyn_cast<ExtractValueInst>(U)) {
+						if (EV->getNumIndices() != 1 || EV->getIndices()[0] > 1) {
+							Ok = false; break;
+						}
+						continue;
 					}
+					if (auto* SI = dyn_cast<StoreInst>(U)) {
+						if (SI->getValueOperand() != LI) { Ok = false; break; }
+						continue;
+					}
+					Ok = false;
+					break;
 				}
 				if (Ok) AggLoads.push_back(LI);
 			}
 		for (LoadInst* LI : AggLoads) {
 			IRBuilder<> B(LI);
+			auto* ST = cast<StructType>(LI->getType());
 			Value* Base = LI->getPointerOperand();
-			Type* I64 = Type::getInt64Ty(Ctx);
-			Align A = LI->getAlign();
-			Value* V0 = B.CreateAlignedLoad(I64, Base, A, LI->isVolatile(), "ldi64.0");
-			uint64_t Off1 = DL.getStructLayout(cast<StructType>(LI->getType()))
-				->getElementOffset(1);
-			Value* P1 = Off1
-				? B.CreateGEP(I8Ty, Base, B.getInt64(Off1), "ldi64.p1")
-				: Base;
-			Value* V1 = B.CreateAlignedLoad(I64, P1, A, LI->isVolatile(), "ldi64.1");
-			SmallVector<ExtractValueInst*, 4> Extracts;
-			for (User* U : LI->users())
-				Extracts.push_back(cast<ExtractValueInst>(U));
-			for (ExtractValueInst* EV : Extracts) {
-				EV->replaceAllUsesWith(EV->getIndices()[0] == 0 ? V0 : V1);
-				EV->eraseFromParent();
+			Align A0 = LI->getAlign();
+			const StructLayout* SL = DL.getStructLayout(ST);
+			auto loadField = [&](unsigned Idx) -> Value* {
+				Type* FT = ST->getElementType(Idx);
+				uint64_t Off = SL->getElementOffset(Idx);
+				Value* Ptr = Off
+					? B.CreateGEP(I8Ty, Base, B.getInt64(Off), "ag.p")
+					: Base;
+				Align A = commonAlignment(A0, Off);
+				if (FT->isPointerTy())
+					return B.CreateAlignedLoad(PtrTy, Ptr, A, LI->isVolatile(), "ag.ld");
+				if (FT->isIntegerTy(64))
+					return B.CreateAlignedLoad(I64Ty, Ptr, A, LI->isVolatile(), "ag.ld");
+				unsigned W = FT->getIntegerBitWidth();
+				if (W <= 32) {
+					Type* LoadTy = (W <= 8) ? I8Ty : (W <= 16) ? I16Ty : I32Ty;
+					Value* V = B.CreateAlignedLoad(LoadTy, Ptr, A, LI->isVolatile(), "ag.ld");
+					if (LoadTy != I32Ty)
+						V = B.CreateZExt(V, I32Ty, "ag.z");
+					if (W == 1)
+						V = B.CreateAnd(V, ConstantInt::get(I32Ty, 1), "ag.i1");
+					return V;
+				}
+				return B.CreateAlignedLoad(I64Ty, Ptr, A, LI->isVolatile(), "ag.ld");
+			};
+			auto storeField = [&](IRBuilder<>& SB, Value* Dest, unsigned Idx, Value* V) {
+				Type* FT = ST->getElementType(Idx);
+				uint64_t Off = SL->getElementOffset(Idx);
+				Value* Ptr = Off
+					? SB.CreateGEP(I8Ty, Dest, SB.getInt64(Off), "ag.sp")
+					: Dest;
+				if (FT->isPointerTy()) {
+					SB.CreateStore(V, Ptr); return;
+				}
+				if (FT->isIntegerTy(64)) {
+					SB.CreateStore(V, Ptr); return;
+				}
+				unsigned W = FT->getIntegerBitWidth();
+				Type* StTy = (W <= 8) ? I8Ty : (W <= 16) ? I16Ty : I32Ty;
+				Value* SV = V;
+				if (SV->getType() != StTy)
+					SV = SB.CreateTrunc(SV, StTy, "ag.tr");
+				SB.CreateStore(SV, Ptr);
+			};
+			Value* V0 = loadField(0);
+			Value* V1 = loadField(1);
+			SmallVector<Instruction*, 4> Dead;
+			for (User* U : LI->users()) {
+				if (auto* EV = dyn_cast<ExtractValueInst>(U)) {
+					EV->replaceAllUsesWith(EV->getIndices()[0] == 0 ? V0 : V1);
+					Dead.push_back(EV);
+				} else if (auto* SI = dyn_cast<StoreInst>(U)) {
+					IRBuilder<> SB(SI);
+					storeField(SB, SI->getPointerOperand(), 0, V0);
+					storeField(SB, SI->getPointerOperand(), 1, V1);
+					Dead.push_back(SI);
+				}
 			}
+			for (Instruction* D : Dead) D->eraseFromParent();
 			LI->eraseFromParent();
+		}
+	}
+
+	// Odd 2-field call returns (not {ptr,i64}): sret wrapper + field loads.
+	{
+		SmallVector<CallInst*, 16> PairCalls;
+		for (BasicBlock& BB : F)
+			for (Instruction& I : BB) {
+				auto* CI = dyn_cast<CallInst>(&I);
+				if (!CI) continue;
+				if (Function* CF = CI->getCalledFunction(); CF && CF->isIntrinsic())
+					continue;
+				Type* RT = CI->getType();
+				auto* ST = dyn_cast<StructType>(RT);
+				if (!ST || ST->getNumElements() != 2) continue;
+				if (isPtrI64Pair(RT)) continue;
+				if (!isSupportedPairElem(ST->getElementType(0)) ||
+					!isSupportedPairElem(ST->getElementType(1)))
+					continue;
+				bool Ok = !CI->user_empty();
+				for (User* U : CI->users()) {
+					if (auto* EV = dyn_cast<ExtractValueInst>(U)) {
+						if (EV->getNumIndices() != 1 || EV->getIndices()[0] > 1) {
+							Ok = false; break;
+						}
+						continue;
+					}
+					if (auto* SI = dyn_cast<StoreInst>(U)) {
+						if (SI->getValueOperand() != CI) { Ok = false; break; }
+						continue;
+					}
+					Ok = false;
+					break;
+				}
+				if (Ok) PairCalls.push_back(CI);
+			}
+
+		unsigned SretId = 0;
+		for (CallInst* CI : PairCalls) {
+			auto* ST = cast<StructType>(CI->getType());
+			Function* CalleeF = CI->getCalledFunction();
+			Value* CalleeV = CI->getCalledOperand();
+
+			SmallVector<Type*, 8> WParams;
+			WParams.push_back(PtrTy);
+			for (Value* A : CI->args())
+				WParams.push_back(A->getType());
+			if (!CalleeF)
+				WParams.push_back(CalleeV->getType());
+			FunctionType* WTy = FunctionType::get(Type::getVoidTy(Ctx), WParams, false);
+			std::string WName = ("__vm_sret_" + std::to_string(SretId++) + "_" +
+				(CalleeF ? CalleeF->getName() : "ind")).str();
+			for (char& C : WName)
+				if (!std::isalnum((unsigned char)C)) C = '_';
+
+			Function* WF = Function::Create(WTy, GlobalValue::InternalLinkage, WName, &M);
+			WF->addFnAttr(Attribute::NoInline);
+			WF->addFnAttr(Attribute::NoUnwind);
+			WF->addParamAttr(0, Attribute::getWithStructRetType(Ctx, ST));
+			BasicBlock* WBB = BasicBlock::Create(Ctx, "entry", WF);
+			IRBuilder<> WB(WBB);
+			SmallVector<Value*, 8> CallArgs;
+			unsigned ArgEnd = CalleeF ? WF->arg_size() : WF->arg_size() - 1;
+			for (unsigned i = 1; i < ArgEnd; ++i)
+				CallArgs.push_back(WF->getArg(i));
+			CallInst* Inner = CalleeF
+				? WB.CreateCall(CalleeF, CallArgs, "sret.r")
+				: WB.CreateCall(CI->getFunctionType(), WF->getArg(ArgEnd), CallArgs, "sret.r");
+			WB.CreateStore(Inner, WF->getArg(0));
+			WB.CreateRetVoid();
+
+			IRBuilder<> B(CI);
+			IRBuilder<> EB(&F.getEntryBlock(),
+				F.getEntryBlock().getFirstInsertionPt());
+			AllocaInst* Tmp = EB.CreateAlloca(ST, nullptr, "sret.tmp");
+			SmallVector<Value*, 8> SiteArgs;
+			SiteArgs.push_back(Tmp);
+			for (Value* A : CI->args())
+				SiteArgs.push_back(A);
+			if (!CalleeF)
+				SiteArgs.push_back(CalleeV);
+			B.CreateCall(WF, SiteArgs);
+
+			const StructLayout* SL = DL.getStructLayout(ST);
+			auto loadField = [&](unsigned Idx) -> Value* {
+				Type* FT = ST->getElementType(Idx);
+				uint64_t Off = SL->getElementOffset(Idx);
+				Value* Ptr = Off
+					? B.CreateGEP(I8Ty, Tmp, B.getInt64(Off), "sret.p")
+					: Tmp;
+				if (FT->isPointerTy())
+					return B.CreateLoad(PtrTy, Ptr, "sret.ld");
+				if (FT->isIntegerTy(64))
+					return B.CreateLoad(I64Ty, Ptr, "sret.ld");
+				unsigned W = FT->getIntegerBitWidth();
+				Type* LoadTy = (W <= 8) ? I8Ty : (W <= 16) ? I16Ty : I32Ty;
+				Value* V = B.CreateLoad(LoadTy, Ptr, "sret.ld");
+				if (LoadTy != I32Ty)
+					V = B.CreateZExt(V, I32Ty, "sret.z");
+				return V;
+			};
+			Value* V0 = loadField(0);
+			Value* V1 = loadField(1);
+			auto storeField = [&](IRBuilder<>& SB, Value* Dest, unsigned Idx, Value* V) {
+				Type* FT = ST->getElementType(Idx);
+				uint64_t Off = SL->getElementOffset(Idx);
+				Value* Ptr = Off
+					? SB.CreateGEP(I8Ty, Dest, SB.getInt64(Off), "sret.sp")
+					: Dest;
+				if (FT->isPointerTy() || FT->isIntegerTy(64)) {
+					SB.CreateStore(V, Ptr); return;
+				}
+				unsigned W = FT->getIntegerBitWidth();
+				Type* StTy = (W <= 8) ? I8Ty : (W <= 16) ? I16Ty : I32Ty;
+				Value* SV = (V->getType() == StTy) ? V : SB.CreateTrunc(V, StTy, "sret.tr");
+				SB.CreateStore(SV, Ptr);
+			};
+			SmallVector<Instruction*, 4> Dead;
+			for (User* U : CI->users()) {
+				if (auto* EV = dyn_cast<ExtractValueInst>(U)) {
+					EV->replaceAllUsesWith(EV->getIndices()[0] == 0 ? V0 : V1);
+					Dead.push_back(EV);
+				} else if (auto* SI = dyn_cast<StoreInst>(U)) {
+					IRBuilder<> SB(SI);
+					storeField(SB, SI->getPointerOperand(), 0, V0);
+					storeField(SB, SI->getPointerOperand(), 1, V1);
+					Dead.push_back(SI);
+				}
+			}
+			for (Instruction* D : Dead) D->eraseFromParent();
+			CI->eraseFromParent();
 		}
 	}
 

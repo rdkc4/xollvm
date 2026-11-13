@@ -236,14 +236,15 @@ uint32_t BytecodeEmitter::isize(Instruction* I) {
 		auto* GEP = cast<GetElementPtrInst>(I);
 		if (!Ty->isPointerTy()) { markUnsupported(I); return 0; }
 
-		// Any fully-constant GEP (struct fields, multi-dim arrays, …) → byte
-		// offset with elemsz 1. Same 6-byte OP_GEP encoding.
+		// Any fully-constant GEP → byte offset with elemsz 1.
+		// Signed fit: i32 → OP_GEP; else i64 → OP_GEP64.
+		// (getActiveBits rejects negatives — e.g. gep ..., i64 -1.)
 		{
 			unsigned AS = GEP->getPointerAddressSpace();
 			APInt COff(DL->getIndexSizeInBits(AS), 0);
 			if (GEP->accumulateConstantOffset(*DL, COff)) {
-				if (COff.getActiveBits() > 31) {
-					markUnsupported(I, "GEP constant byte offset exceeds i32");
+				if (!COff.isSignedIntN(64)) {
+					markUnsupported(I, "GEP constant byte offset exceeds i64");
 					return 0;
 				}
 				return 6;
@@ -966,7 +967,7 @@ void BytecodeEmitter::emit(Instruction* I) {
 			uint8_t V64 = PIt->second.second;
 			uint8_t Scratch = allocScratchPR();
 			if (Scratch == kInvalidSlot) {
-				markUnsupported(I, "preg file overflow (>250 slots)");
+				markUnsupported(I, "preg file overflow (>254 slots)");
 				return;
 			}
 			auto* CIV = ConstantInt::get(Type::getInt32Ty(I->getContext()), Off1);
@@ -983,24 +984,35 @@ void BytecodeEmitter::emit(Instruction* I) {
 	if (Op == Instruction::GetElementPtr && Ty->isPointerTy()) {
 		auto* GEP = cast<GetElementPtrInst>(I);
 
-		// Fully-constant GEPs (struct fields, multi-dim arrays, …): encode as
-		// base + byte offset with elemsz 1. Variable array GEPs use idx * stride.
+		// Fully-constant GEPs: base + byte offset with elemsz 1.
+		// Signed fit i32 → OP_GEP; else signed i64 → OP_GEP64.
 		{
 			unsigned AS = GEP->getPointerAddressSpace();
 			APInt COff(DL->getIndexSizeInBits(AS), 0);
 			if (GEP->accumulateConstantOffset(*DL, COff)) {
-				if (COff.getActiveBits() > 31) {
-					markUnsupported(I, "GEP constant byte offset exceeds i32");
+				if (!COff.isSignedIntN(64)) {
+					markUnsupported(I, "GEP constant byte offset exceeds i64");
 					return;
 				}
-				auto* CIV = ConstantInt::get(
-					Type::getInt32Ty(GEP->getContext()), COff.getZExtValue());
-				bop(OP_GEP);
-				b8(xorSalt(newPR(I)));
-				b8(xorSalt(pr(GEP->getPointerOperand())));
-				b8(xorSalt(vr(CIV)));
-				b8(1);
-				b8(0);
+				if (COff.isSignedIntN(32)) {
+					Constant* CIV = ConstantInt::getSigned(
+						Type::getInt32Ty(GEP->getContext()), COff.getSExtValue());
+					bop(OP_GEP);
+					b8(xorSalt(newPR(I)));
+					b8(xorSalt(pr(GEP->getPointerOperand())));
+					b8(xorSalt(vr(CIV)));
+					b8(1);
+					b8(0);
+				} else {
+					Constant* CIV = ConstantInt::getSigned(
+						Type::getInt64Ty(GEP->getContext()), COff.getSExtValue());
+					bop(OP_GEP64);
+					b8(xorSalt(newPR(I)));
+					b8(xorSalt(pr(GEP->getPointerOperand())));
+					b8(xorSalt(vr64(CIV)));
+					b8(1);
+					b8(0);
+				}
 				return;
 			}
 		}

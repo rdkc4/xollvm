@@ -202,19 +202,44 @@ If the function is skipped, the skip reason is recorded in the obfuscation repor
 
 Before slot assignment, `VMImpl::run()` rewrites IR the emitter cannot encode:
 
-- **Tier B:** `memcpy` / `memset` / `memmove` with constant size in `(0, 1024]` → chunked
-  i64/i32/i16/i8 load/store (memmove via an entry alloca temp).
+- **Tier B:** `memcpy` / `memset` / `memmove` with constant size in `(0, 4096]` → expanded
+  (≤128 B fully unrolled i64/i32/i16/i8 stores; larger sizes call internal
+  `__vm_memcpy_loop` / `__vm_memset_loop` so the site stays O(1) slots). Memmove uses an
+  entry alloca temp then two copies. Non-const or larger sizes become libc
+  `@memcpy` / `@memset` / `@memmove` (not left as intrinsics).
 - **Tier C/D:** float helpers (`fabs`, `fmuladd`, …), `abs`,
   `llvm.umul.with.overflow` (i32/i64) → mul plus an unsigned-overflow i1 (extractvalue
   rewritten), `llvm.ctpop` (i32/i64) → SWAR parallel bitcount, and `llvm.cttz`
   (i32/i64) → `(x==0) ? BW : ctpop((x & -x) - 1)` (zero yields bitwidth even when
   `is_zero_poison`).
-- **`load {i64,i64}`** with extractvalue-only users → two aligned `load i64` (base /
-  base+offset); aggregate is not a VM slot type.
+- **Tier E (native thunks):** `llvm.trap`, `ceil`/`floor`/`trunc`/`nearbyint`/`rint`/`round`
+  → `internal` `__vm_nat_*` helpers that still contain the intrinsic; the VM emits a normal
+  `CALL_*` and the LLVM backend lowers the intrinsic.
+- **Auto-split (va_*):** if `F` is varargs and contains `va_start`, public `F` becomes a
+  **native shell** (`va_start` → call `__vm_core_va_*` with `va_list*` → `va_end`); the core
+  is virtualized. `va_arg` / `va_copy` stay in the core (they only need a live list).
+- **Auto-split (odd-pair return of F):** if `F` returns a supported 2-field aggregate that is
+  not `{ptr,i64}`, public `F` is a native shell (alloca → call `__vm_core_sret_*` →
+  insertvalue/ret); the void sret core is virtualized.
+- **Switch legalize:** non-i32 `switch` → zext/trunc to i32 when cases fit, else icmp/br chain.
+- **Odd-width ints:** widths other than 1/8/16/32/64.
+  - Bitfield RMW: `store or(and(load,clear), insert)` → `__vm_il_deposit` (clear field
+    must be contiguous ≤64 bits; insert may be trunc/zext/shl/and or a bare constant,
+    including zero-init `or %cleared, 0`).
+  - Bitfield reads: `load → [lshr/ashr] → [and] → trunc/zext` → `__vm_il_extract`
+    (any container width, including i88/i104; field ≤64).
+  - Leftover ≤64 odd SSA (`trunc`/`and`/`or`/`shl`/`load`/`store`, e.g. i40/i56):
+    promote to masked i64; `store` via `memcpy` of `(W+7)/8` bytes.
+  **MBA** must not rewrite BO of non-{8,16,32,64} width. When VM is co-enabled, MBA
+  `maxSites` is throttled on large functions so live SSA stays under the u8 slot cap (≤254).
+- **Aggregate load:** 2-field structs of ptr / i64 / int≤32 with extractvalue- or aggregate-store
+  users → scalar loads at DL offsets (`commonAlignment` for field1).
+- **Odd pair calls:** 2-field returns that are not `{ptr,i64}` → `internal` sret wrapper
+  (`__vm_sret_*`) + alloca / field loads (`OP_CALL_PAIR` stays `{ptr,i64}` only).
 
-Fully-constant GEPs of any index count (multi-dim arrays, struct fields, …) encode as
-`OP_GEP` with byte offset and `elemsz=1`. Soft CALL arg limit is `kVMCallMaxArgs` (64;
-encoding hard max 127).
+Fully-constant GEPs of any index count encode as byte offset with `elemsz=1`: **signed**
+fit in i32 → `OP_GEP`; else signed i64 → `OP_GEP64` (covers `gep ..., i64 -1`). Soft CALL
+arg limit is `kVMCallMaxArgs` (64; encoding hard max 127).
 
 ### PHI demotion
 
@@ -308,7 +333,7 @@ passed through a per-function permutation (see [Opcode permutation](#opcode-perm
 | `OP_INTTOPTR64` | 0x3A | `opc dstp:u8 src64:u8` (3 B) | `inttoptr` vreg64 (i64) → preg (inverse of `OP_PTRTOINT64`). |
 | `OP_LOAD32` | 0x07 | `opc dst:u8 ptrreg:u8` (3 B) | Load i32 from address in preg. |
 | `OP_STORE32` | 0x08 | `opc val:u8 ptrreg:u8` (3 B) | Store i32 to address in preg. |
-| `OP_GEP` | 0x09 | `opc dstp:u8 basep:u8 idx:u8 elemsz:u16le` (6 B) | GEP: `basep + idx * elemsz` → preg. Fully-constant multi-index GEPs use byte offset with `elemsz=1`. |
+| `OP_GEP` | 0x09 | `opc dstp:u8 basep:u8 idx:u8 elemsz:u16le` (6 B) | GEP: `basep + idx * elemsz` → preg. Fully-constant multi-index GEPs use byte offset with `elemsz=1` when the offset fits i32. |
 | `OP_LOAD8` | 0x1B | `opc dst:u8 ptrreg:u8` (3 B) | Load i8 (zero-extend to i32). `load i1` is this plus `CK_TRUNC1` on the same slot. |
 | `OP_STORE8` | 0x1C | `opc val:u8 ptrreg:u8` (3 B) | Truncate vreg to i8, store. Also used for `store i1` (1-byte). |
 | `OP_LOAD16` | 0x1D | `opc dst:u8 ptrreg:u8` (3 B) | Load i16 (zero-extend to i32). |
@@ -334,7 +359,7 @@ passed through a per-function permutation (see [Opcode permutation](#opcode-perm
 | `OP_CAST64` | 0x16 | `opc dst:u8 src:u8 kind:u8` (4 B) | Cross-file cast between i32 and i64. See Cast64Kind table. |
 | `OP_BINOP64` | 0x17 | `opc dst64:u8 a64:u8 b64:u8 subop:u8` (5 B) | Binary op on vreg64 file. Same BinSubop encoding. |
 | `OP_ICMP64` | 0x1A | `opc dst:u8 a64:u8 b64:u8 pred:u8` (5 B) | 64-bit integer compare; result → vreg (i32). |
-| `OP_GEP64` | 0x19 | `opc dstp:u8 basep:u8 idx64:u8 elemsz:u16le` (6 B) | GEP with 64-bit index. |
+| `OP_GEP64` | 0x19 | `opc dstp:u8 basep:u8 idx64:u8 elemsz:u16le` (6 B) | GEP with 64-bit index (variable i64 idx, or signed const byte offset outside i32 but in i64, `elemsz=1`). |
 | `OP_LOADI64` | 0x33 | `opc dst64:u8 imm:i64le` (10 B) | Load 64-bit immediate into vreg64. Emitted by `constInStream` to carry i64 constants inside the encrypted bytecode prologue instead of a plaintext wrapper store. |
 
 </details>

@@ -581,6 +581,14 @@ void VMImpl::buildHandlersConv() {
 		stPR(B, DP, B.CreateIntToPtr(ldVR(B, Src), PtrTy, "vm.pp.v")); nextInsn(B);
 	}
 
+	//  OP_INTTOPTR64 -- [dstp:u8 src64:u8]
+	{
+		auto B = mkOpc(OP_INTTOPTR64, "inttoptr64");
+		Value* IP = advIP(B, 2);
+		Value* DP = rdPR(B, IP, 0, "vm.pp64.d"), * Src = rdVR64(B, IP, 1, "vm.pp64.s");
+		stPR(B, DP, B.CreateIntToPtr(ldVR64(B, Src), PtrTy, "vm.pp64.v")); nextInsn(B);
+	}
+
 }
 
 void VMImpl::buildHandlersMem() {

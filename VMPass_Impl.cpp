@@ -56,7 +56,7 @@ bool VMImpl::run() {
 	//                    uses an entry alloca temp then two forward copies.
 	//        C) Float  — fabs, fmuladd, fma, minnum, maxnum, copysign:
 	//                    expand to FNeg/FMul/FAdd/FCmp/Select the VM handles.
-	//        D) Int    — abs; umul.with.overflow (i32/i64); ctpop (i32/i64):
+	//        D) Int    — abs; umul.with.overflow (i32/i64); ctpop/cttz (i32/i64):
 	//                    expand to IR the VM already encodes.
 	//      Also: load {i64,i64} with extractvalue-only users → two i64 loads.
 	//      Anything else stays and isize() will markUnsupported gracefully.
@@ -280,40 +280,64 @@ bool VMImpl::run() {
 				}
 			}
 
-			//  Tier D: ctpop → SWAR parallel bitcount (OP_BINOP-friendly).
+			//  Tier D: ctpop / cttz → SWAR (OP_BINOP-friendly).
+			auto expandCtpop = [&](IRBuilder<>& IB, Value* X) -> Value* {
+				Type* IT = X->getType();
+				unsigned BW = IT->getIntegerBitWidth();
+				auto C = [&](uint64_t V) { return ConstantInt::get(IT, V); };
+				auto shr = [&](Value* V, unsigned S, const Twine& N) {
+					return IB.CreateLShr(V, C(S), N);
+				};
+				Value* T = IB.CreateSub(X,
+					IB.CreateAnd(shr(X, 1, "ct.pop.s1"),
+						C(BW == 32 ? 0x55555555ull : 0x5555555555555555ull),
+						"ct.pop.a1"),
+					"ct.pop.t1");
+				T = IB.CreateAdd(
+					IB.CreateAnd(T, C(BW == 32 ? 0x33333333ull : 0x3333333333333333ull),
+						"ct.pop.a2"),
+					IB.CreateAnd(shr(T, 2, "ct.pop.s2"),
+						C(BW == 32 ? 0x33333333ull : 0x3333333333333333ull),
+						"ct.pop.a3"),
+					"ct.pop.t2");
+				T = IB.CreateAnd(
+					IB.CreateAdd(T, shr(T, 4, "ct.pop.s4"), "ct.pop.t3"),
+					C(BW == 32 ? 0x0F0F0F0Full : 0x0F0F0F0F0F0F0F0Full),
+					"ct.pop.t4");
+				T = IB.CreateAdd(T, shr(T, 8, "ct.pop.s8"), "ct.pop.t5");
+				T = IB.CreateAdd(T, shr(T, 16, "ct.pop.s16"), "ct.pop.t6");
+				if (BW == 64)
+					T = IB.CreateAdd(T, shr(T, 32, "ct.pop.s32"), "ct.pop.t7");
+				return IB.CreateAnd(T, C(BW == 32 ? 0x3Full : 0x7Full), "ct.pop.r");
+			};
+
 			if (IID == Intrinsic::ctpop) {
 				Value* X = CI->getArgOperand(0);
 				Type* IT = X->getType();
 				unsigned BW = IT->isIntegerTy() ? IT->getIntegerBitWidth() : 0;
 				if (BW == 32 || BW == 64) {
-					auto C = [&](uint64_t V) { return ConstantInt::get(IT, V); };
-					auto shr = [&](Value* V, unsigned S, const Twine& N) {
-						return B.CreateLShr(V, C(S), N);
-					};
-					// x = x - ((x >> 1) & 0x5555...)
-					Value* T = B.CreateSub(X,
-						B.CreateAnd(shr(X, 1, "ct.pop.s1"),
-							C(BW == 32 ? 0x55555555ull : 0x5555555555555555ull),
-							"ct.pop.a1"),
-						"ct.pop.t1");
-					// x = (x & 0x3333...) + ((x >> 2) & 0x3333...)
-					T = B.CreateAdd(
-						B.CreateAnd(T, C(BW == 32 ? 0x33333333ull : 0x3333333333333333ull),
-							"ct.pop.a2"),
-						B.CreateAnd(shr(T, 2, "ct.pop.s2"),
-							C(BW == 32 ? 0x33333333ull : 0x3333333333333333ull),
-							"ct.pop.a3"),
-						"ct.pop.t2");
-					// x = (x + (x >> 4)) & 0x0F0F...
-					T = B.CreateAnd(
-						B.CreateAdd(T, shr(T, 4, "ct.pop.s4"), "ct.pop.t3"),
-						C(BW == 32 ? 0x0F0F0F0Full : 0x0F0F0F0F0F0F0F0Full),
-						"ct.pop.t4");
-					T = B.CreateAdd(T, shr(T, 8, "ct.pop.s8"), "ct.pop.t5");
-					T = B.CreateAdd(T, shr(T, 16, "ct.pop.s16"), "ct.pop.t6");
-					if (BW == 64)
-						T = B.CreateAdd(T, shr(T, 32, "ct.pop.s32"), "ct.pop.t7");
-					Value* R = B.CreateAnd(T, C(BW == 32 ? 0x3Full : 0x7Full), "ct.pop.r");
+					CI->replaceAllUsesWith(expandCtpop(B, X));
+					CI->eraseFromParent();
+					continue;
+				}
+			}
+
+			// cttz(x) = (x == 0) ? BW : ctpop((x & -x) - 1).
+			// is_zero_poison: returning BW on zero refines poison and matches
+			// the defined-on-zero intrinsic.
+			if (IID == Intrinsic::cttz) {
+				Value* X = CI->getArgOperand(0);
+				Type* IT = X->getType();
+				unsigned BW = IT->isIntegerTy() ? IT->getIntegerBitWidth() : 0;
+				if (BW == 32 || BW == 64) {
+					Value* Zero = ConstantInt::get(IT, 0);
+					Value* Lowest = B.CreateAnd(X, B.CreateSub(Zero, X, "ct.tz.neg"),
+						"ct.tz.low");
+					Value* Count = expandCtpop(B,
+						B.CreateSub(Lowest, ConstantInt::get(IT, 1), "ct.tz.m1"));
+					Value* R = B.CreateSelect(
+						B.CreateICmpEQ(X, Zero, "ct.tz.z"),
+						ConstantInt::get(IT, BW), Count, "ct.tz.r");
 					CI->replaceAllUsesWith(R);
 					CI->eraseFromParent();
 					continue;

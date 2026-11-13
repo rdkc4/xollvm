@@ -277,6 +277,12 @@ namespace llvm {
 				if (!chk(IP, "vreg", decIdx(BC[IP + 2]), E.NVR)) return false;
 				IP += 3; break;
 			}
+			case OP_INTTOPTR64: {
+				if (IP + 3 > BC.size()) return fail(IP, "OP_INTTOPTR64 truncated");
+				if (!chk(IP, "preg", decIdx(BC[IP + 1]), E.NPR)) return false;
+				if (!chk(IP, "vreg64", decIdx(BC[IP + 2]), E.NVR64)) return false;
+				IP += 3; break;
+			}
 			case OP_LOAD32: {
 				if (IP + 3 > BC.size()) return fail(IP, "OP_LOAD32 truncated");
 				if (!chk(IP, "vreg", decIdx(BC[IP + 1]), E.NVR)) return false;

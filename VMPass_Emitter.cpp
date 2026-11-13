@@ -198,7 +198,10 @@ uint32_t BytecodeEmitter::isize(Instruction* I) {
 		markUnsupported(I); return 0;
 	}
 	if (Op == Instruction::IntToPtr) {
-		if (Ty->isPointerTy() && I->getOperand(0)->getType()->isIntegerTy(32)) return 3;
+		if (Ty->isPointerTy() &&
+			(I->getOperand(0)->getType()->isIntegerTy(32) ||
+			 I->getOperand(0)->getType()->isIntegerTy(64)))
+			return 3;
 		markUnsupported(I); return 0;
 	}
 	if (Op == Instruction::Load) {
@@ -882,8 +885,14 @@ void BytecodeEmitter::emit(Instruction* I) {
 		bop(OP_PTRTOINT64); b8(xorSalt(newVR64(I))); b8(xorSalt(pr(I->getOperand(0)))); return;
 	}
 	if (Op == Instruction::IntToPtr && Ty->isPointerTy()) {
-		if (!I->getOperand(0)->getType()->isIntegerTy(32)) { markUnsupported(I); return; }
-		bop(OP_INTTOPTR); b8(xorSalt(newPR(I))); b8(xorSalt(vr(I->getOperand(0)))); return;
+		Type* ST = I->getOperand(0)->getType();
+		if (ST->isIntegerTy(32)) {
+			bop(OP_INTTOPTR); b8(xorSalt(newPR(I))); b8(xorSalt(vr(I->getOperand(0)))); return;
+		}
+		if (ST->isIntegerTy(64)) {
+			bop(OP_INTTOPTR64); b8(xorSalt(newPR(I))); b8(xorSalt(vr64(I->getOperand(0)))); return;
+		}
+		markUnsupported(I); return;
 	}
 	if (Op == Instruction::Load && (Ty->isIntegerTy(1) || Ty->isIntegerTy(8))) {
 		uint8_t D = newVR(I);

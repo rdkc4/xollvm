@@ -6,7 +6,7 @@
 // dependency-free (only primitive headers, no LLVM IR headers).
 //
 // Exports:
-//   VMOp        — logical opcode enum (0x00 .. 0x39, OP_COUNT = 0x3A)
+//   VMOp        — logical opcode enum (0x00 .. 0x3A, OP_COUNT = 0x3B)
 //   CallArgType — 2-bit per-arg encoding for CALL argtypes u16   [Step 02]
 //   BinSubop    — sub-opcode byte for OP_BINOP / OP_BINOP64
 //   CastKind    — kind byte for OP_CAST  (i32 register file)
@@ -134,7 +134,10 @@ namespace llvm {
 		// Call returning exact {ptr, i64}. Dual dst: preg + vreg64.
 		OP_CALL_PAIR = 0x39,  // dstp:u8 dst64:u8 fn:u8 nargs:u8 [arg:u8 * nargs]
 
-		OP_COUNT = 0x3A
+		// Inverse of OP_PTRTOINT64: inttoptr i64 → preg.
+		OP_INTTOPTR64 = 0x3A,  // dstp:u8 src64:u8
+
+		OP_COUNT = 0x3B
 	};
 
 	// Max handler-body variants per opcode in the shared __vm_engine.
@@ -149,8 +152,8 @@ namespace llvm {
 	// M4 hooks them behind opaque-false guards). Count driven by
 	// VMPassConfig.handlerDecoys (0 = off = zero decoys registered).
 	static constexpr unsigned kMaxDecoys      = 32;
-	static constexpr uint8_t  OP_DECOY_BASE   = 0x3A;  // == OP_COUNT
-	static constexpr unsigned OP_COUNT_TOTAL  = (unsigned)OP_DECOY_BASE + kMaxDecoys;  // 0x5A
+	static constexpr uint8_t  OP_DECOY_BASE   = 0x3B;  // == OP_COUNT
+	static constexpr unsigned OP_COUNT_TOTAL  = (unsigned)OP_DECOY_BASE + kMaxDecoys;  // 0x5B
 	static_assert((unsigned)OP_DECOY_BASE == (unsigned)OP_COUNT, "OP_DECOY_BASE must sit immediately after real opcodes");
 
 	// ============================================================================

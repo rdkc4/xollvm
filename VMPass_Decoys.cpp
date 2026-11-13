@@ -67,7 +67,7 @@ unsigned VMImpl::computeNumDecoys() const {
 	}
 
 	switch (Cfg.handlerDecoys) {
-		case 1:  return 14;          // ~25% of OP_COUNT (0x3A == 58)
+		case 1:  return 14;          // ~25% of OP_COUNT (0x3B == 59)
 		case 2:  return 28;          // ~50%
 		case 3:  return kMaxDecoys;  // 32, hard cap
 		default: return 0;           // off (byte-identical)

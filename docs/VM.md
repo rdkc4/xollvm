@@ -206,7 +206,9 @@ Before slot assignment, `VMImpl::run()` rewrites IR the emitter cannot encode:
   i64/i32/i16/i8 load/store (memmove via an entry alloca temp).
 - **Tier C/D:** float helpers (`fabs`, `fmuladd`, …), `abs`,
   `llvm.umul.with.overflow` (i32/i64) → mul plus an unsigned-overflow i1 (extractvalue
-  rewritten), and `llvm.ctpop` (i32/i64) → SWAR parallel bitcount.
+  rewritten), `llvm.ctpop` (i32/i64) → SWAR parallel bitcount, and `llvm.cttz`
+  (i32/i64) → `(x==0) ? BW : ctpop((x & -x) - 1)` (zero yields bitwidth even when
+  `is_zero_poison`).
 - **`load {i64,i64}`** with extractvalue-only users → two aligned `load i64` (base /
   base+offset); aggregate is not a VM slot type.
 
@@ -281,7 +283,7 @@ After bytecode emission, `VMImpl::run()` calls these builders in order:
 
 ## ISA reference
 
-The ISA has **58 logical opcodes** (`OP_COUNT = 0x3A`), variable-width encoding,
+The ISA has **59 logical opcodes** (`OP_COUNT = 0x3B`), variable-width encoding,
 and little-endian multi-byte immediates. (Recent additions: `OP_LOADI64` = 0x33
 used by `constInStream`, four fusion opcodes from `superOps` —
 `OP_MULADD`/`OP_SHLADD`/`OP_CMPSEL`/`OP_ANDCMPZ`, plus `OP_ICMP_PTR` = 0x38
@@ -302,7 +304,8 @@ passed through a per-function permutation (see [Opcode permutation](#opcode-perm
 | `OP_ICMP_PTR` | 0x38 | `opc dst:u8 a:u8 b:u8 pred:u8` (5 B) | Pointer compare (`eq`/`ne`); preg×preg → vreg 0/1. |
 | `OP_CAST` | 0x04 | `opc dst:u8 src:u8 kind:u8` (4 B) | Integer widening/narrowing within the i32 file (incl. `zext i1→i8`). See CastKind table. |
 | `OP_PTRTOINT` | 0x05 | `opc dst:u8 srcp:u8` (3 B) | `ptrtoint` preg → vreg (i32). |
-| `OP_INTTOPTR` | 0x06 | `opc dstp:u8 src:u8` (3 B) | `inttoptr` vreg → preg. |
+| `OP_INTTOPTR` | 0x06 | `opc dstp:u8 src:u8` (3 B) | `inttoptr` vreg (i32) → preg. |
+| `OP_INTTOPTR64` | 0x3A | `opc dstp:u8 src64:u8` (3 B) | `inttoptr` vreg64 (i64) → preg (inverse of `OP_PTRTOINT64`). |
 | `OP_LOAD32` | 0x07 | `opc dst:u8 ptrreg:u8` (3 B) | Load i32 from address in preg. |
 | `OP_STORE32` | 0x08 | `opc val:u8 ptrreg:u8` (3 B) | Store i32 to address in preg. |
 | `OP_GEP` | 0x09 | `opc dstp:u8 basep:u8 idx:u8 elemsz:u16le` (6 B) | GEP: `basep + idx * elemsz` → preg. Fully-constant multi-index GEPs use byte offset with `elemsz=1`. |
@@ -494,6 +497,7 @@ is rounded back to f32 precision via fptrunc→fpext before being stored).
 | `OP_CAST` | 4 | `opc dst src kind` |
 | `OP_PTRTOINT` | 3 | `opc dst srcp` |
 | `OP_INTTOPTR` | 3 | `opc dstp src` |
+| `OP_INTTOPTR64` | 3 | `opc dstp src64` |
 | `OP_LOAD32/8/16` | 3 | `opc dst ptrreg` |
 | `OP_STORE32/8/16` | 3 | `opc val ptrreg` |
 | `OP_LOADPTR` | 3 | `opc dstp ptrreg` |

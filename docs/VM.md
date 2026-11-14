@@ -228,8 +228,11 @@ Before slot assignment, `VMImpl::run()` rewrites IR the emitter cannot encode:
     including zero-init `or %cleared, 0`).
   - Bitfield reads: `load → [lshr/ashr] → [and] → trunc/zext` → `__vm_il_extract`
     (any container width, including i88/i104; field ≤64).
-  - Leftover ≤64 odd SSA (`trunc`/`and`/`or`/`shl`/`load`/`store`, e.g. i40/i56):
-    promote to masked i64; `store` via `memcpy` of `(W+7)/8` bytes.
+  - Leftover ≤64 odd SSA (e.g. i40/i56): **general** promote to masked i64 —
+    all integer binops (`add`/`sub`/`mul`/`and`/`or`/`xor`/`shl`/`lshr`/`ashr`/
+    `udiv`/`sdiv`/`urem`/`srem`), `icmp`, `select`, `trunc`/`zext`/`sext`,
+    `load`/`store` (`store` via `memcpy` of `(W+7)/8` bytes). >64 arith stays
+    bitfield-only (`__vm_il_*`); not promoted into the i64 file.
   **MBA** must not rewrite BO of non-{8,16,32,64} width. When VM is co-enabled, MBA
   `maxSites` is throttled on large functions so live SSA stays under the u8 slot cap (≤254).
 - **Aggregate load:** 2-field structs of ptr / i64 / int≤32 with extractvalue- or aggregate-store

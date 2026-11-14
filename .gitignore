@@ -57,3 +57,7 @@ CLAUDE.md
 .claude/
 docs/VM_GAP_ANALYSIS.md
 docs/design/
+
+# VM ISA suite - generated corpus + work dirs (regen via gen_tests.py)
+vm_test/categories/
+vm_test/.work/

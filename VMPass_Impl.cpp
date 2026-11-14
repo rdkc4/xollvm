@@ -1346,26 +1346,116 @@ bool VMImpl::run() {
 			}
 		}
 
-		// Pass 3: ≤64 odd SSA → masked i64 (covers leftover trunc/and/or/shl/store)
+		// Pass 3: ≤64 odd SSA → masked i64 (all binops + icmp/select + mem/casts)
 		{
 			DenseMap<Value*, Value*> I64Of;
 			DenseSet<Value*> MatInProg;
 			std::function<Value*(Value*)> materialize;
 			std::function<bool(Value*, Value*, unsigned)> rewriteUsers;
+			std::function<Value*(IRBuilder<>&, Value*)> promotePeer;
 
-			auto promotePeer = [&](IRBuilder<>& B, Value* Peer) -> Value* {
+			// Emit i64 op equivalent of an illegal-width binary operator.
+			auto emitBinop64 = [&](IRBuilder<>& B, unsigned Op, Value* A64,
+				Value* B64, unsigned Width, const Twine& Name) -> Value* {
+				Value* R = nullptr;
+				switch (Op) {
+				case Instruction::Add:  R = B.CreateAdd(A64, B64, Name); break;
+				case Instruction::Sub:  R = B.CreateSub(A64, B64, Name); break;
+				case Instruction::Mul:  R = B.CreateMul(A64, B64, Name); break;
+				case Instruction::And:  R = B.CreateAnd(A64, B64, Name); break;
+				case Instruction::Or:   R = B.CreateOr(A64, B64, Name); break;
+				case Instruction::Xor:  R = B.CreateXor(A64, B64, Name); break;
+				case Instruction::Shl:  R = B.CreateShl(A64, B64, Name); break;
+				case Instruction::LShr: R = B.CreateLShr(A64, B64, Name); break;
+				case Instruction::AShr: {
+					// Sign-extend within Width bits before arithmetic shift.
+					Value* Sh = ConstantInt::get(I64Ty, 64 - Width);
+					Value* S = B.CreateAShr(B.CreateShl(A64, Sh), Sh, Name + ".se");
+					R = B.CreateAShr(S, B64, Name);
+					break;
+				}
+				case Instruction::UDiv: R = B.CreateUDiv(A64, B64, Name); break;
+				case Instruction::SDiv: {
+					Value* Sh = ConstantInt::get(I64Ty, 64 - Width);
+					Value* SA = B.CreateAShr(B.CreateShl(A64, Sh), Sh, Name + ".sa");
+					Value* SB = B.CreateAShr(B.CreateShl(B64, Sh), Sh, Name + ".sb");
+					R = B.CreateSDiv(SA, SB, Name);
+					break;
+				}
+				case Instruction::URem: R = B.CreateURem(A64, B64, Name); break;
+				case Instruction::SRem: {
+					Value* Sh = ConstantInt::get(I64Ty, 64 - Width);
+					Value* SA = B.CreateAShr(B.CreateShl(A64, Sh), Sh, Name + ".sa");
+					Value* SB = B.CreateAShr(B.CreateShl(B64, Sh), Sh, Name + ".sb");
+					R = B.CreateSRem(SA, SB, Name);
+					break;
+				}
+				default:
+					return nullptr;
+				}
+				return B.CreateAnd(R, i64Mask(Width), Name + ".m");
+			};
+			auto isPromotableBinop = [](unsigned Op) -> bool {
+				switch (Op) {
+				case Instruction::Add: case Instruction::Sub: case Instruction::Mul:
+				case Instruction::And: case Instruction::Or: case Instruction::Xor:
+				case Instruction::Shl: case Instruction::LShr: case Instruction::AShr:
+				case Instruction::UDiv: case Instruction::SDiv:
+				case Instruction::URem: case Instruction::SRem:
+					return true;
+				default:
+					return false;
+				}
+			};
+
+			promotePeer = [&](IRBuilder<>& B, Value* Peer) -> Value* {
 				if (auto* C = dyn_cast<ConstantInt>(Peer))
 					return ConstantInt::get(I64Ty, C->getZExtValue());
 				if (Value* Cached = I64Of.lookup(Peer))
 					return Cached;
 				if (unsigned PW = illegalInt(Peer->getType())) {
 					if (PW > 64) return nullptr;
+					// Illegal binops: build i64 form from operands
+					// (materialize() only roots load/trunc/zext/sext).
+					if (auto* BO = dyn_cast<BinaryOperator>(Peer)) {
+						unsigned Op = BO->getOpcode();
+						if (!isPromotableBinop(Op))
+							return nullptr;
+						if (MatInProg.contains(BO))
+							return nullptr;
+						// Promote operands BEFORE marking MatInProg so a nested
+						// path can complete this same BO (use-list order often
+						// hits mul/xor before add has been cached).
+						IRBuilder<> LocalB(BO);
+						Value* A64 = promotePeer(LocalB, BO->getOperand(0));
+						if (!A64) return nullptr;
+						if (Value* Cached = I64Of.lookup(BO))
+							return Cached;
+						Value* B64 = promotePeer(LocalB, BO->getOperand(1));
+						if (!B64) return nullptr;
+						if (Value* Cached = I64Of.lookup(BO))
+							return Cached;
+						MatInProg.insert(BO);
+						Value* R = emitBinop64(LocalB, Op, A64, B64, PW, "il.pr");
+						if (!R) { MatInProg.erase(BO); return nullptr; }
+						I64Of[BO] = R;
+						MatInProg.erase(BO);
+						// Only cache here. Caller rewriteUsers finishes consumers.
+						return R;
+					}
 					return materialize(Peer);
 				}
 				if (Peer->getType()->isIntegerTy(64))
 					return Peer;
-				if (Peer->getType()->isIntegerTy())
+				if (Peer->getType()->isIntegerTy()) {
+					// Insert at Peer when it is an instruction so the cast
+					// dominates Peer’s consumers; else use caller builder.
+					if (auto* PI = dyn_cast<Instruction>(Peer)) {
+						IRBuilder<> LocalB(PI);
+						return LocalB.CreateZExtOrTrunc(Peer, I64Ty, "il.pr");
+					}
 					return B.CreateZExtOrTrunc(Peer, I64Ty, "il.pr");
+				}
 				return nullptr;
 			};
 
@@ -1440,63 +1530,44 @@ bool VMImpl::run() {
 					}
 					if (auto* BO = dyn_cast<BinaryOperator>(U)) {
 						unsigned Op = BO->getOpcode();
-						if (Op != Instruction::And && Op != Instruction::Or &&
-							Op != Instruction::Xor && Op != Instruction::Shl &&
-							Op != Instruction::LShr && Op != Instruction::AShr)
+						if (!isPromotableBinop(Op))
 							return false;
-						if (Value* Cached = I64Of.lookup(BO)) {
-							(void)Cached;
+						if (!BO->getParent())
 							continue;
-						}
-						if (MatInProg.contains(BO)) {
-							// Peer owns this BO; detach Old.
-							if (BO->getOperand(0) == Old)
-								BO->setOperand(0, UndefValue::get(Old->getType()));
-							else if (BO->getOperand(1) == Old)
-								BO->setOperand(1, UndefValue::get(Old->getType()));
+						if (MatInProg.contains(BO))
 							continue;
-						}
-						IRBuilder<> BB(BO);
-						Value* Peer = BO->getOperand(0) == Old
-							? BO->getOperand(1) : BO->getOperand(0);
-						Value* PeerI64 = nullptr;
-						Value* R = nullptr;
-						if (Op == Instruction::LShr || Op == Instruction::AShr ||
-							Op == Instruction::Shl) {
-							auto* CI = dyn_cast<ConstantInt>(Peer);
-							if (!CI) return false;
-							unsigned ShAmt = (unsigned)CI->getZExtValue();
-							Value* ShC = ConstantInt::get(I64Ty, ShAmt);
-							if (Op == Instruction::LShr)
-								R = BB.CreateLShr(NewI64, ShC, "il.lshr");
-							else if (Op == Instruction::AShr) {
-								Value* S = BB.CreateAShr(
-									BB.CreateShl(NewI64, ConstantInt::get(I64Ty, 64 - OldW)),
-									ConstantInt::get(I64Ty, 64 - OldW));
-								R = BB.CreateAShr(S, ShC, "il.ashr");
-							} else
-								R = BB.CreateShl(NewI64, ShC, "il.shl");
-							unsigned ResW = illegalInt(BO->getType());
-							if (!ResW) ResW = OldW;
-							if (ResW <= 64)
-								R = BB.CreateAnd(R, i64Mask(std::min(ResW, 64u)), "il.shnm");
-						} else {
-							PeerI64 = promotePeer(BB, Peer);
-							if (!PeerI64) return false;
-							if (Op == Instruction::And)
-								R = BB.CreateAnd(NewI64, PeerI64, "il.and");
-							else if (Op == Instruction::Or)
-								R = BB.CreateOr(NewI64, PeerI64, "il.or");
-							else
-								R = BB.CreateXor(NewI64, PeerI64, "il.xor");
-							unsigned ResW = illegalInt(BO->getType());
-							if (!ResW) ResW = OldW;
-							if (ResW <= 64)
-								R = BB.CreateAnd(R, i64Mask(std::min(ResW, 64u)), "il.bom");
-						}
 						unsigned ResW = illegalInt(BO->getType());
-						if (!ResW) {
-							// Result became legal somehow — cast down
+						if (!ResW) ResW = OldW;
+						if (ResW > 64) return false;
+						Value* R = I64Of.lookup(BO);
+						if (!R) {
+							IRBuilder<> BB(BO);
+							Value* Op0 = BO->getOperand(0);
+							Value* Op1 = BO->getOperand(1);
+							Value* A64 = (Op0 == Old) ? NewI64
+								: promotePeer(BB, Op0);
+							if (!A64) return false;
+							if (!BO->getParent() || MatInProg.contains(BO))
+								continue;
+							if (Value* Cached = I64Of.lookup(BO)) {
+								R = Cached;
+							} else {
+								Value* B64 = (Op1 == Old) ? NewI64
+									: promotePeer(BB, Op1);
+								if (!B64) return false;
+								if (!BO->getParent() || MatInProg.contains(BO))
+									continue;
+								if (Value* Cached2 = I64Of.lookup(BO)) {
+									R = Cached2;
+								} else {
+									R = emitBinop64(BB, Op, A64, B64, ResW, "il.bo");
+									if (!R) return false;
+									I64Of[BO] = R;
+								}
+							}
+						}
+						if (!illegalInt(BO->getType())) {
+							IRBuilder<> BB(BO);
 							Value* Out = R;
 							if (BO->getType() != I64Ty)
 								Out = BB.CreateZExtOrTrunc(R, BO->getType(), "il.boty");
@@ -1504,9 +1575,67 @@ bool VMImpl::run() {
 							BO->eraseFromParent();
 							continue;
 						}
-						if (ResW > 64) return false;
-						if (!rewriteUsers(BO, R, ResW)) return false;
-						if (BO->use_empty()) BO->eraseFromParent();
+						// Re-entrancy guard while rewriting this BO's consumers.
+						MatInProg.insert(BO);
+						bool Ok = rewriteUsers(BO, R, ResW);
+						MatInProg.erase(BO);
+						if (!Ok) return false;
+						if (BO->getParent() && BO->use_empty())
+							BO->eraseFromParent();
+						continue;
+					}
+					if (auto* CmpI = dyn_cast<ICmpInst>(U)) {
+						// icmp → i1 (legal). Compare masked i64 forms.
+						if (!CmpI->getParent()) continue;
+						Instruction* InsertBefore = CmpI;
+						Value* Peer = CmpI->getOperand(0) == Old
+							? CmpI->getOperand(1) : CmpI->getOperand(0);
+						IRBuilder<> CB(InsertBefore);
+						Value* PeerI64 = promotePeer(CB, Peer);
+						if (!PeerI64) return false;
+						// Nested promotePeer→rewriteUsers may have already
+						// replaced this icmp; do not touch a dead instr.
+						if (!CmpI->getParent()) continue;
+						Value* A64 = (CmpI->getOperand(0) == Old) ? NewI64 : PeerI64;
+						Value* B64 = (CmpI->getOperand(0) == Old) ? PeerI64 : NewI64;
+						CmpInst::Predicate Pred = CmpI->getPredicate();
+						CB.SetInsertPoint(CmpI);
+						if (CmpI->isSigned()) {
+							Value* Sh = ConstantInt::get(I64Ty, 64 - OldW);
+							A64 = CB.CreateAShr(CB.CreateShl(A64, Sh), Sh, "il.icmp.sa");
+							B64 = CB.CreateAShr(CB.CreateShl(B64, Sh), Sh, "il.icmp.sb");
+						}
+						Value* Cmp = CB.CreateICmp(Pred, A64, B64, "il.icmp");
+						CmpI->replaceAllUsesWith(Cmp);
+						CmpI->eraseFromParent();
+						continue;
+					}
+					if (auto* SelI = dyn_cast<SelectInst>(U)) {
+						// select i1, iN, iN  (N illegal ≤64) → select on i64 + mask
+						if (SelI->getCondition() == Old)
+							return false; // cond must be i1, not odd-int
+						if (!SelI->getParent()) continue;
+						unsigned ResW = illegalInt(SelI->getType());
+						if (!ResW || ResW > 64) return false;
+						if (I64Of.lookup(SelI)) continue;
+						IRBuilder<> SB(SelI);
+						Value* TrueV = SelI->getTrueValue();
+						Value* FalseV = SelI->getFalseValue();
+						Value* T64 = (TrueV == Old) ? NewI64 : promotePeer(SB, TrueV);
+						Value* F64 = (FalseV == Old) ? NewI64 : promotePeer(SB, FalseV);
+						if (!T64 || !F64) return false;
+						if (!SelI->getParent() || I64Of.lookup(SelI)) continue;
+						SB.SetInsertPoint(SelI);
+						Value* R = SB.CreateSelect(SelI->getCondition(), T64, F64, "il.sel");
+						R = SB.CreateAnd(R, i64Mask(ResW), "il.sel.m");
+						I64Of[SelI] = R;
+						if (!rewriteUsers(SelI, R, ResW)) {
+							if (SelI->getParent() && SelI->use_empty())
+								SelI->eraseFromParent();
+							return SelI->getParent() ? false : true;
+						}
+						if (SelI->getParent() && SelI->use_empty())
+							SelI->eraseFromParent();
 						continue;
 					}
 					return false;
@@ -1563,7 +1692,18 @@ bool VMImpl::run() {
 				}
 				I64Of[V] = R;
 				MatInProg.erase(V);
-				if (!rewriteUsers(V, R, W)) return nullptr;
+				if (!rewriteUsers(V, R, W)) {
+					// Nested promote/materialize may have finished rewriting
+					// every use of V even though this call returned false
+					// (e.g. peer binop order). Treat use-empty as success.
+					if (auto* I = dyn_cast<Instruction>(V)) {
+						if (I->use_empty()) {
+							I->eraseFromParent();
+							return R;
+						}
+					}
+					return nullptr;
+				}
 				if (auto* I = dyn_cast<Instruction>(V))
 					if (I->use_empty()) I->eraseFromParent();
 				return R;
@@ -1581,6 +1721,22 @@ bool VMImpl::run() {
 			for (Instruction* Root : Roots) {
 				if (!Root->getParent() || Root->use_empty()) continue;
 				materialize(Root);
+			}
+			// Post-promote DCE: illegal ops whose consumers were rewritten to
+			// the i64 form can remain as a dead chain (e.g. add→sub with no
+			// external uses). Erase use-empty only — live illegal values are
+			// real failures left for the emitter to reject.
+			bool IlDCE = true;
+			while (IlDCE) {
+				IlDCE = false;
+				for (BasicBlock& BB : F) {
+					for (Instruction& I : make_early_inc_range(BB)) {
+						if (!illegalInt(I.getType()) || !I.use_empty())
+							continue;
+						I.eraseFromParent();
+						IlDCE = true;
+					}
+				}
 			}
 		}
 	}

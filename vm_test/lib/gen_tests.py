@@ -503,6 +503,19 @@ uint32_t obf_target(uint32_t x, uint32_t y) {
 }
 ''', {**BASE_EXPECT, "must_match": BASE_EXPECT["must_match"] + [r"vm\.opc\.load_f32", r"vm\.opc\.store_f32"]})
 
+    # i32 type-pun through float local — must keep 4-byte float memory
+    # (regression: obsolete f2d widen broke SetPhyVgpr(float)).
+    write("05_float", "test_float_alloca_bitpun", r'''
+{ANN}
+uint32_t obf_target(uint32_t x, uint32_t y) {
+    union { float f; uint32_t u; } pun;
+    pun.f = (float)x + (float)y * 0.5f;
+    uint32_t bits = pun.u;
+    pun.u = bits;
+    return bits ^ (uint32_t)(long)(pun.f * 10.f);
+}
+''', {**BASE_EXPECT, "must_match": BASE_EXPECT["must_match"] + [r"vm\.opc\.store_f32"]})
+
     write("05_float", "test_ret_f_via_bits", r'''
 {ANN}
 double obf_d(uint32_t x, uint32_t y) {
@@ -607,6 +620,23 @@ uint32_t obf_target(uint32_t x, uint32_t y) {
 }
 ''', {**BASE_EXPECT, "must_match": BASE_EXPECT["must_match"] + [
         r"vm\.opc\.call_int64", r"vm\.opc\.call_f",
+    ]})
+
+    # float CALL ABI — args/returns must stay float, not double
+    write("07_calls", "test_call_float", r'''
+__attribute__((noinline)) static float helper_f32(float a, float b) {
+    return a * 2.0f + b;
+}
+
+{ANN}
+uint32_t obf_target(uint32_t x, uint32_t y) {
+    float r = helper_f32((float)x, (float)y);
+    union { float f; uint32_t u; } pun;
+    pun.f = r;
+    return pun.u ^ (uint32_t)(long)(r * 10.f);
+}
+''', {**BASE_EXPECT, "must_match": BASE_EXPECT["must_match"] + [
+        r"vm\.opc\.call_f",
     ]})
 
     write("07_calls", "test_call_narrow", r'''
@@ -1057,8 +1087,8 @@ def build_coverage() -> dict:
         "OP_FCAST_V64F": ["05_float/test_fcast"],
         "OP_LOAD_F": ["05_float/test_float_mem_f64"],
         "OP_STORE_F": ["05_float/test_float_mem_f64"],
-        "OP_LOAD_F32": ["05_float/test_float_mem_f32"],
-        "OP_STORE_F32": ["05_float/test_float_mem_f32"],
+        "OP_LOAD_F32": ["05_float/test_float_mem_f32", "05_float/test_float_alloca_bitpun"],
+        "OP_STORE_F32": ["05_float/test_float_mem_f32", "05_float/test_float_alloca_bitpun"],
         "OP_RET_F": ["05_float/test_ret_f_via_bits"],
         "OP_PTRTOINT": ["06_ptr/test_ptrtoint_inttoptr"],
         "OP_PTRTOINT64": ["06_ptr/test_ptrtoint_inttoptr"],
@@ -1071,7 +1101,7 @@ def build_coverage() -> dict:
                         "07_calls/test_call_byval"],
         "OP_CALL_PTR": ["07_calls/test_call_int_void_ptr"],
         "OP_CALL_INT64": ["07_calls/test_call_i64_f"],
-        "OP_CALL_F": ["07_calls/test_call_i64_f"],
+        "OP_CALL_F": ["07_calls/test_call_i64_f", "07_calls/test_call_float"],
         "OP_CALL_PAIR": ["07_calls/test_call_pair"],
         "OP_MULADD": ["10_superops/test_muladd"],
         "OP_SHLADD": ["10_superops/test_shladd"],

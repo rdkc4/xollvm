@@ -715,9 +715,15 @@ void VMImpl::ensureCallFTyCases() {
 
 			SmallVector<Type*, VMEngine::MaxArgs> ATys;
 			SmallVector<Value*, VMEngine::MaxArgs> CA;
+			Type* FloatTy = Type::getFloatTy(Ctx);
 			for (unsigned i = 0; i < N && i < VMEngine::MaxArgs; ++i) {
 				Type* PT = SrcFTy->getParamType(i);
-				if (PT->isFloatTy() || PT->isDoubleTy()) {
+				if (PT->isFloatTy()) {
+					ATys.push_back(FloatTy);
+					CA.push_back(CB.CreateFPTrunc(CSW.FregVals[i], FloatTy,
+						"vm.cl.ftr"));
+				}
+				else if (PT->isDoubleTy()) {
 					ATys.push_back(DoubleTy);
 					CA.push_back(CSW.FregVals[i]);
 				}
@@ -733,13 +739,18 @@ void VMImpl::ensureCallFTyCases() {
 			}
 
 			// Match buildCall2: narrow int returns use the concrete ABI width,
-			// then zext into the i32 RetPHI / vreg (OP_CALL_INT).
+			// then zext into the i32 RetPHI / vreg (OP_CALL_INT). Float returns
+			// keep float width then fpext into the f64 RetPHI.
 			Type* CallRetTy = RetTy;
 			if (RK == VMEngine::RK2_I32) {
 				Type* SRT = SrcFTy->getReturnType();
 				if (SRT->isIntegerTy() && SRT->getIntegerBitWidth() <= 32) {
 					CallRetTy = SRT;
 				}
+			} else if (RK == VMEngine::RK2_F64) {
+				Type* SRT = SrcFTy->getReturnType();
+				if (SRT->isFloatTy())
+					CallRetTy = SRT;
 			}
 			auto* CallFTy = FunctionType::get(CallRetTy, ATys, isVA);
 			auto* CI = CB.CreateCall(CallFTy, CSW.Callee, CA,
@@ -747,7 +758,10 @@ void VMImpl::ensureCallFTyCases() {
 			if (!IsVoid && CSW.RetPHI) {
 				Value* RetV = CI;
 				if (CallRetTy != RetTy) {
-					RetV = CB.CreateZExt(CI, RetTy, "vm.cl.rz");
+					if (CallRetTy->isFloatTy() && RetTy->isDoubleTy())
+						RetV = CB.CreateFPExt(CI, RetTy, "vm.cl.fext");
+					else
+						RetV = CB.CreateZExt(CI, RetTy, "vm.cl.rz");
 				}
 				CSW.RetPHI->addIncoming(RetV, CB.GetInsertBlock());
 			}

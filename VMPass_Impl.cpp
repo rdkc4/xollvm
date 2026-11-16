@@ -2025,51 +2025,8 @@ bool VMImpl::run() {
 		}
 	}
 
-	// Widen f32 allocas to f64 so OP_LOAD_F / OP_STORE_F (which always
-	// operate on 8 bytes) never read/write past the end of a 4-byte slot.
-	// At -O0 each float local is an alloca used only by load/store float;
-	// widening is semantics-preserving: fpext on stores, fptrunc on loads.
-	{
-		SmallVector<AllocaInst*, 16> FloatAllocas;
-		for (BasicBlock& BB : F)
-			for (Instruction& I : BB)
-				if (auto* AI = dyn_cast<AllocaInst>(&I))
-					if (AI->getAllocatedType()->isFloatTy())
-						FloatAllocas.push_back(AI);
-
-		for (AllocaInst* AI : FloatAllocas) {
-			IRBuilder<> AB(AI);
-			auto* NewAI = AB.CreateAlloca(DoubleTy, nullptr, AI->getName() + ".f2d");
-			NewAI->setAlignment(Align(8));
-
-			SmallVector<Instruction*, 16> ToErase;
-			SmallVector<std::pair<Use*, Value*>, 16> ToReplace;
-
-			for (Use& U : AI->uses()) {
-				auto* User = cast<Instruction>(U.getUser());
-				if (auto* SI = dyn_cast<StoreInst>(User)) {
-					IRBuilder<> B(SI);
-					B.CreateStore(B.CreateFPExt(SI->getValueOperand(), DoubleTy, "f2d.ext"), NewAI);
-					ToErase.push_back(SI);
-				}
-				else if (auto* LI = dyn_cast<LoadInst>(User)) {
-					IRBuilder<> B(LI);
-					Value* Dbl = B.CreateLoad(DoubleTy, NewAI, "f2d.ld");
-					Value* Trn = B.CreateFPTrunc(Dbl, Type::getFloatTy(Ctx), "f2d.trn");
-					LI->replaceAllUsesWith(Trn);
-					ToErase.push_back(LI);
-				}
-				else {
-					ToReplace.push_back({ &U, NewAI });
-				}
-			}
-			for (Instruction* I : ToErase)  I->eraseFromParent();
-			for (auto& [U, V] : ToReplace)  U->set(V);
-			AI->eraseFromParent();
-		}
-	}
-
-
+	// f32 locals stay alloca float. OP_LOAD_F32 / OP_STORE_F32 handle 4-byte
+	// memory; do not widen to double — that breaks i32 type-pun through &float
 
 	// Compile function body to bytecode
 	E.setOpcodeMap(&OpMap);

@@ -68,18 +68,18 @@ void VMImpl::buildHandlersIntArith() {
 	//  OP_LOADI  [dst:u8 imm:u32le] -- vreg[dst] = imm 
 	{
 		auto B = mkOpc(OP_LOADI, "loadi");
-		Value* IP = advIP(B, 5);
-		stVR(B, rdVR(B, IP, 0, "vm.li.d"), rdU32(B, IP, 1, "vm.li.i"));
+		Value* IP = advIP(B, 6);
+		stVR(B, rdVR(B, IP, 0, "vm.li.d"), rdU32(B, IP, 2, "vm.li.i"));
 		nextInsn(B);
 	}
 
 	//  OP_LOADI64  [dst64:u8 imm:i64le] -- vreg64[dst] = imm
 	{
 		auto B = mkOpc(OP_LOADI64, "loadi64");
-		Value* IP = advIP(B, 9);
+		Value* IP = advIP(B, 10);
 		Value* Dst = rdVR64(B, IP, 0, "vm.li64.d");
-		Value* Lo = B.CreateZExt(rdU32(B, IP, 1, "vm.li64.lo"), I64Ty, "vm.li64.loz");
-		Value* Hi = B.CreateZExt(rdU32(B, IP, 5, "vm.li64.hi"), I64Ty, "vm.li64.hiz");
+		Value* Lo = B.CreateZExt(rdU32(B, IP, 2, "vm.li64.lo"), I64Ty, "vm.li64.loz");
+		Value* Hi = B.CreateZExt(rdU32(B, IP, 6, "vm.li64.hi"), I64Ty, "vm.li64.hiz");
 		Value* Imm = B.CreateOr(Lo, B.CreateShl(Hi, B.getInt64(32), "vm.li64.hs"), "vm.li64.v");
 		stVR64(B, Dst, Imm);
 		nextInsn(B);
@@ -88,8 +88,8 @@ void VMImpl::buildHandlersIntArith() {
 	//  OP_MOVR  [dst:u8 src:u8] -- vreg[dst] = vreg[src]
 	{
 		auto B = mkOpc(OP_MOVR, "movr");
-		Value* IP = advIP(B, 2);
-		stVR(B, rdVR(B, IP, 0, "vm.mr.d"), ldVR(B, rdVR(B, IP, 1, "vm.mr.s")));
+		Value* IP = advIP(B, 4);
+		stVR(B, rdVR(B, IP, 0, "vm.mr.d"), ldVR(B, rdVR(B, IP, 2, "vm.mr.s")));
 		nextInsn(B);
 	}
 
@@ -97,11 +97,11 @@ void VMImpl::buildHandlersIntArith() {
 	// NOTE: must not speculatively execute div/rem for other subops (would trap on BV==0).
 	{
 		auto B = mkOpc(OP_BINOP, "binop");
-		Value* IP = advIP(B, 4);
+		Value* IP = advIP(B, 7);
 		Value* Dst = rdVR(B, IP, 0, "vm.bo.d");
-		Value* AIdx = rdVR(B, IP, 1, "vm.bo.a");
-		Value* BIdx = rdVR(B, IP, 2, "vm.bo.b");
-		Value* Sub = rdByte(B, IP, 3, "vm.bo.op");
+		Value* AIdx = rdVR(B, IP, 2, "vm.bo.a");
+		Value* BIdx = rdVR(B, IP, 4, "vm.bo.b");
+		Value* Sub = rdByte(B, IP, 6, "vm.bo.op");
 		Value* AV = ldVR(B, AIdx);
 		Value* BV = ldVR(B, BIdx);
 
@@ -162,11 +162,11 @@ void VMImpl::buildHandlersIntArith() {
 	//  OP_MULADD  -- [dst:u8 a:u8 b:u8 c:u8] -- dst = a*b + c (i32, superOps fusion)
 	{
 		auto B = mkOpc(OP_MULADD, "muladd");
-		Value* IP = advIP(B, 4);
+		Value* IP = advIP(B, 8);
 		Value* Dst = rdVR(B, IP, 0, "vm.ma.d");
-		Value* AIdx = rdVR(B, IP, 1, "vm.ma.a");
-		Value* BIdx = rdVR(B, IP, 2, "vm.ma.b");
-		Value* CIdx = rdVR(B, IP, 3, "vm.ma.c");
+		Value* AIdx = rdVR(B, IP, 2, "vm.ma.a");
+		Value* BIdx = rdVR(B, IP, 4, "vm.ma.b");
+		Value* CIdx = rdVR(B, IP, 6, "vm.ma.c");
 		Value* AV = ldVR(B, AIdx);
 		Value* BV = ldVR(B, BIdx);
 		Value* CV = ldVR(B, CIdx);
@@ -178,11 +178,11 @@ void VMImpl::buildHandlersIntArith() {
 	//  OP_SHLADD -- [dst:u8 a:u8 b:u8 c:u8] -- dst = (a<<b) + c (i32, superOps fusion)
 	{
 		auto B = mkOpc(OP_SHLADD, "shladd");
-		Value* IP = advIP(B, 4);
+		Value* IP = advIP(B, 8);
 		Value* Dst = rdVR(B, IP, 0, "vm.sa.d");
-		Value* AIdx = rdVR(B, IP, 1, "vm.sa.a");
-		Value* BIdx = rdVR(B, IP, 2, "vm.sa.b");
-		Value* CIdx = rdVR(B, IP, 3, "vm.sa.c");
+		Value* AIdx = rdVR(B, IP, 2, "vm.sa.a");
+		Value* BIdx = rdVR(B, IP, 4, "vm.sa.b");
+		Value* CIdx = rdVR(B, IP, 6, "vm.sa.c");
 		Value* AV = ldVR(B, AIdx);
 		Value* BV = ldVR(B, BIdx);
 		Value* CV = ldVR(B, CIdx);
@@ -194,13 +194,13 @@ void VMImpl::buildHandlersIntArith() {
 	//  OP_CMPSEL -- [dst:u8 a:u8 b:u8 pred:u8 t:u8 f:u8] -- dst = (a <pred> b) ? t : f  (i32, superOps fusion)
 	{
 		auto B = mkOpc(OP_CMPSEL, "cmpsel");
-		Value* IP = advIP(B, 6);
+		Value* IP = advIP(B, 11);
 		Value* Dst = rdVR(B, IP, 0, "vm.cs.d");
-		Value* AIdx = rdVR(B, IP, 1, "vm.cs.a");
-		Value* BIdx = rdVR(B, IP, 2, "vm.cs.b");
-		Value* Pred = rdByte(B, IP, 3, "vm.cs.p");
-		Value* TIdx = rdVR(B, IP, 4, "vm.cs.t");
-		Value* FIdx = rdVR(B, IP, 5, "vm.cs.f");
+		Value* AIdx = rdVR(B, IP, 2, "vm.cs.a");
+		Value* BIdx = rdVR(B, IP, 4, "vm.cs.b");
+		Value* Pred = rdByte(B, IP, 6, "vm.cs.p");
+		Value* TIdx = rdVR(B, IP, 7, "vm.cs.t");
+		Value* FIdx = rdVR(B, IP, 9, "vm.cs.f");
 		Value* AV = ldVR(B, AIdx), * BV = ldVR(B, BIdx);
 		using P = CmpInst::Predicate;
 		Value* Cs[] = {
@@ -224,11 +224,11 @@ void VMImpl::buildHandlersIntArith() {
 	//  OP_ANDCMPZ -- [dst:u8 a:u8 b:u8 pred:u8] -- dst = ((a&b) <eq|ne> 0) (i32 0/1, superOps fusion)
 	{
 		auto B = mkOpc(OP_ANDCMPZ, "andcmpz");
-		Value* IP = advIP(B, 4);
+		Value* IP = advIP(B, 7);
 		Value* Dst = rdVR(B, IP, 0, "vm.ac.d");
-		Value* AIdx = rdVR(B, IP, 1, "vm.ac.a");
-		Value* BIdx = rdVR(B, IP, 2, "vm.ac.b");
-		Value* Pred = rdByte(B, IP, 3, "vm.ac.p");
+		Value* AIdx = rdVR(B, IP, 2, "vm.ac.a");
+		Value* BIdx = rdVR(B, IP, 4, "vm.ac.b");
+		Value* Pred = rdByte(B, IP, 6, "vm.ac.p");
 		Value* AV = ldVR(B, AIdx), * BV = ldVR(B, BIdx);
 		Value* M = B.CreateAnd(AV, BV, "vm.ac.m");
 		// pred is EQ or NE only; select the compare-to-zero accordingly.
@@ -246,11 +246,11 @@ void VMImpl::buildHandlersIntArith() {
 	// NOTE: must not speculatively execute div/rem for other subops (would trap on BV==0).
 	{
 		auto B = mkOpc(OP_BINOP64, "binop64");
-		Value* IP = advIP(B, 4);
+		Value* IP = advIP(B, 7);
 		Value* Dst = rdVR64(B, IP, 0, "vm.bo64.d");
-		Value* AIdx = rdVR64(B, IP, 1, "vm.bo64.a");
-		Value* BIdx = rdVR64(B, IP, 2, "vm.bo64.b");
-		Value* Sub = rdByte(B, IP, 3, "vm.bo64.op");
+		Value* AIdx = rdVR64(B, IP, 2, "vm.bo64.a");
+		Value* BIdx = rdVR64(B, IP, 4, "vm.bo64.b");
+		Value* Sub = rdByte(B, IP, 6, "vm.bo64.op");
 		Value* AV = ldVR64(B, AIdx);
 		Value* BV = ldVR64(B, BIdx);
 
@@ -307,9 +307,9 @@ void VMImpl::buildHandlersIntArith() {
 	//  OP_ICMP -- [dst:u8 a:u8 b:u8 pred:u8] 
 	{
 		auto B = mkOpc(OP_ICMP, "icmp");
-		Value* IP = advIP(B, 4);
-		Value* Dst = rdVR(B, IP, 0, "vm.ic.d"), * AIdx = rdVR(B, IP, 1, "vm.ic.a");
-		Value* BIdx = rdVR(B, IP, 2, "vm.ic.b"), * Pred = rdByte(B, IP, 3, "vm.ic.p");
+		Value* IP = advIP(B, 7);
+		Value* Dst = rdVR(B, IP, 0, "vm.ic.d"), * AIdx = rdVR(B, IP, 2, "vm.ic.a");
+		Value* BIdx = rdVR(B, IP, 4, "vm.ic.b"), * Pred = rdByte(B, IP, 6, "vm.ic.p");
 		Value* AV = ldVR(B, AIdx), * BV = ldVR(B, BIdx);
 
 		if (NestedVM && opcodeNests(OP_ICMP)) {
@@ -344,11 +344,11 @@ void VMImpl::buildHandlersIntArith() {
 	//  OP_ICMP64 -- [dst:u8 a:u8 b:u8 pred:u8] 
 	{
 		auto B = mkOpc(OP_ICMP64, "icmp64");
-		Value* IP = advIP(B, 4);
+		Value* IP = advIP(B, 7);
 		Value* Dst = rdVR(B, IP, 0, "vm.ic64.d");
-		Value* AIdx = rdVR64(B, IP, 1, "vm.ic64.a");
-		Value* BIdx = rdVR64(B, IP, 2, "vm.ic64.b");
-		Value* Pred = rdByte(B, IP, 3, "vm.ic64.p");
+		Value* AIdx = rdVR64(B, IP, 2, "vm.ic64.a");
+		Value* BIdx = rdVR64(B, IP, 4, "vm.ic64.b");
+		Value* Pred = rdByte(B, IP, 6, "vm.ic64.p");
 		Value* AV = ldVR64(B, AIdx), * BV = ldVR64(B, BIdx);
 
 		if (NestedVM && opcodeNests(OP_ICMP64)) {
@@ -381,11 +381,11 @@ void VMImpl::buildHandlersIntArith() {
 	//  OP_ICMP_PTR -- [dst:u8 a:u8 b:u8 pred:u8]  preg×preg → vreg 0/1 (eq/ne)
 	{
 		auto B = mkOpc(OP_ICMP_PTR, "icmp_ptr");
-		Value* IP = advIP(B, 4);
+		Value* IP = advIP(B, 7);
 		Value* Dst = rdVR(B, IP, 0, "vm.icp.d");
-		Value* AIdx = rdPR(B, IP, 1, "vm.icp.a");
-		Value* BIdx = rdPR(B, IP, 2, "vm.icp.b");
-		Value* Pred = rdByte(B, IP, 3, "vm.icp.p");
+		Value* AIdx = rdPR(B, IP, 2, "vm.icp.a");
+		Value* BIdx = rdPR(B, IP, 4, "vm.icp.b");
+		Value* Pred = rdByte(B, IP, 6, "vm.icp.p");
 		Value* AV = ldPR(B, AIdx), * BV = ldPR(B, BIdx);
 		using P = CmpInst::Predicate;
 		Value* Eq = B.CreateICmpEQ(AV, BV, "vm.icp.eq");
@@ -401,8 +401,8 @@ void VMImpl::buildHandlersIntArith() {
 	//  OP_CAST -- [dst:u8 src:u8 kind:u8] 
 	{
 		auto B = mkOpc(OP_CAST, "cast");
-		Value* IP = advIP(B, 3);
-		Value* Dst = rdVR(B, IP, 0, "vm.ca.d"), * Src = rdVR(B, IP, 1, "vm.ca.s"), * Kind = rdByte(B, IP, 2, "vm.ca.k");
+		Value* IP = advIP(B, 5);
+		Value* Dst = rdVR(B, IP, 0, "vm.ca.d"), * Src = rdVR(B, IP, 2, "vm.ca.s"), * Kind = rdByte(B, IP, 4, "vm.ca.k");
 		Value* SV = ldVR(B, Src);
 
 		if (NestedVM && opcodeNests(OP_CAST)) {
@@ -429,7 +429,7 @@ void VMImpl::buildHandlersConv() {
 	// kind 0: integer vregs (dst/t/f are VR) ; kind 1: pointer pregs (dst/t/f are PR) ; kind 2: i64 vregs (dst/t/f are VR64)
 	{
 		auto B = mkOpc(OP_SELECT, "select");
-		Value* IP = advIP(B, 5);
+		Value* IP = advIP(B, 9);
 		Value* Kind = rdByte(B, IP, 0, "vm.sl.k");
 		Value* IsPtr = B.CreateICmpEQ(Kind, B.getInt32(1), "vm.sl.isp");
 		Value* IsI64 = B.CreateICmpEQ(Kind, B.getInt32(2), "vm.sl.is64");
@@ -450,9 +450,9 @@ void VMImpl::buildHandlersConv() {
 		{
 			IRBuilder<> BP(PtrBB);
 			Value* DstP = rdPR(BP, IP, 1, "vm.sl.pd");
-			Value* Cond = rdVR(BP, IP, 2, "vm.sl.pc");
-			Value* TP = ldPR(BP, rdPR(BP, IP, 3, "vm.sl.pt"));
-			Value* FP = ldPR(BP, rdPR(BP, IP, 4, "vm.sl.pf"));
+			Value* Cond = rdVR(BP, IP, 3, "vm.sl.pc");
+			Value* TP = ldPR(BP, rdPR(BP, IP, 5, "vm.sl.pt"));
+			Value* FP = ldPR(BP, rdPR(BP, IP, 7, "vm.sl.pf"));
 			Value* Bool = BP.CreateICmpNE(ldVR(BP, Cond), BP.getInt32(0), "vm.sl.pb");
 			stPR(BP, DstP, BP.CreateSelect(Bool, TP, FP, "vm.sl.pr"));
 			nextInsn(BP);
@@ -462,9 +462,9 @@ void VMImpl::buildHandlersConv() {
 		{
 			IRBuilder<> BI(IntBB);
 			Value* Dst = rdVR(BI, IP, 1, "vm.sl.id");
-			Value* Cond = rdVR(BI, IP, 2, "vm.sl.ic");
-			Value* TV = ldVR(BI, rdVR(BI, IP, 3, "vm.sl.it"));
-			Value* FV = ldVR(BI, rdVR(BI, IP, 4, "vm.sl.if"));
+			Value* Cond = rdVR(BI, IP, 3, "vm.sl.ic");
+			Value* TV = ldVR(BI, rdVR(BI, IP, 5, "vm.sl.it"));
+			Value* FV = ldVR(BI, rdVR(BI, IP, 7, "vm.sl.if"));
 			Value* Bool = BI.CreateICmpNE(ldVR(BI, Cond), BI.getInt32(0), "vm.sl.ib");
 			stVR(BI, Dst, BI.CreateSelect(Bool, TV, FV, "vm.sl.ir"));
 			nextInsn(BI);
@@ -474,9 +474,9 @@ void VMImpl::buildHandlersConv() {
 		{
 			IRBuilder<> B64(I64BB);
 			Value* Dst = rdVR64(B64, IP, 1, "vm.sl.64d");
-			Value* Cond = rdVR(B64, IP, 2, "vm.sl.64c");
-			Value* TV = ldVR64(B64, rdVR64(B64, IP, 3, "vm.sl.64t"));
-			Value* FV = ldVR64(B64, rdVR64(B64, IP, 4, "vm.sl.64f"));
+			Value* Cond = rdVR(B64, IP, 3, "vm.sl.64c");
+			Value* TV = ldVR64(B64, rdVR64(B64, IP, 5, "vm.sl.64t"));
+			Value* FV = ldVR64(B64, rdVR64(B64, IP, 7, "vm.sl.64f"));
 			Value* Bool = B64.CreateICmpNE(ldVR(B64, Cond), B64.getInt32(0), "vm.sl.64b");
 			stVR64(B64, Dst, B64.CreateSelect(Bool, TV, FV, "vm.sl.64r"));
 			nextInsn(B64);
@@ -485,8 +485,8 @@ void VMImpl::buildHandlersConv() {
 	//  OP_PTRTOINT -- [dst:u8 srcp:u8] 
 	{
 		auto B = mkOpc(OP_PTRTOINT, "ptrtoint");
-		Value* IP = advIP(B, 2);
-		Value* Dst = rdVR(B, IP, 0, "vm.pi.d"), * SP = rdPR(B, IP, 1, "vm.pi.s");
+		Value* IP = advIP(B, 4);
+		Value* Dst = rdVR(B, IP, 0, "vm.pi.d"), * SP = rdPR(B, IP, 2, "vm.pi.s");
 		stVR(B, Dst, B.CreatePtrToInt(ldPR(B, SP), I32Ty, "vm.pi.v")); nextInsn(B);
 	}
 
@@ -494,8 +494,8 @@ void VMImpl::buildHandlersConv() {
 	//  OP_CAST64 -- [dst:u8 src:u8 kind:u8] 
 	{
 		auto B = mkOpc(OP_CAST64, "cast64");
-		Value* IP = advIP(B, 3);
-		Value* Kind = rdByte(B, IP, 2, "vm.c64.k");
+		Value* IP = advIP(B, 5);
+		Value* Kind = rdByte(B, IP, 4, "vm.c64.k");
 
 		Value* IsTrunc = B.CreateICmpUGE(Kind, B.getInt32((uint32_t)C64_TRUNC1), "vm.c64.tr");
 		BasicBlock* ExtBB = BasicBlock::Create(Ctx, "vm.c64.ext", HFn);
@@ -506,7 +506,7 @@ void VMImpl::buildHandlersConv() {
 		{
 			IRBuilder<> BE(ExtBB);
 			Value* Dst = rdVR64(BE, IP, 0, "vm.c64.d");
-			Value* Src = rdVR(BE, IP, 1, "vm.c64.s");
+			Value* Src = rdVR(BE, IP, 2, "vm.c64.s");
 			Value* SV = ldVR(BE, Src);
 
 			auto ze = [&](uint32_t M) -> Value* {
@@ -543,7 +543,7 @@ void VMImpl::buildHandlersConv() {
 		{
 			IRBuilder<> BT(TrBB);
 			Value* Dst = rdVR(BT, IP, 0, "vm.c64.td");
-			Value* Src = rdVR64(BT, IP, 1, "vm.c64.ts");
+			Value* Src = rdVR64(BT, IP, 2, "vm.c64.ts");
 			Value* SV = ldVR64(BT, Src);
 			Value* Lo32 = BT.CreateTrunc(SV, I32Ty, "vm.c64.lo");
 
@@ -567,8 +567,8 @@ void VMImpl::buildHandlersConv() {
 	//  OP_PTRTOINT64 -- [dst64:u8 srcp:u8] 
 	{
 		auto B = mkOpc(OP_PTRTOINT64, "ptrtoint64");
-		Value* IP = advIP(B, 2);
-		Value* Dst = rdVR64(B, IP, 0, "vm.pi64.d"), * SP = rdPR(B, IP, 1, "vm.pi64.s");
+		Value* IP = advIP(B, 4);
+		Value* Dst = rdVR64(B, IP, 0, "vm.pi64.d"), * SP = rdPR(B, IP, 2, "vm.pi64.s");
 		stVR64(B, Dst, B.CreatePtrToInt(ldPR(B, SP), I64Ty, "vm.pi64.v")); nextInsn(B);
 	}
 
@@ -576,16 +576,16 @@ void VMImpl::buildHandlersConv() {
 	//  OP_INTTOPTR -- [dstp:u8 src:u8] 
 	{
 		auto B = mkOpc(OP_INTTOPTR, "inttoptr");
-		Value* IP = advIP(B, 2);
-		Value* DP = rdPR(B, IP, 0, "vm.pp.d"), * Src = rdVR(B, IP, 1, "vm.pp.s");
+		Value* IP = advIP(B, 4);
+		Value* DP = rdPR(B, IP, 0, "vm.pp.d"), * Src = rdVR(B, IP, 2, "vm.pp.s");
 		stPR(B, DP, B.CreateIntToPtr(ldVR(B, Src), PtrTy, "vm.pp.v")); nextInsn(B);
 	}
 
 	//  OP_INTTOPTR64 -- [dstp:u8 src64:u8]
 	{
 		auto B = mkOpc(OP_INTTOPTR64, "inttoptr64");
-		Value* IP = advIP(B, 2);
-		Value* DP = rdPR(B, IP, 0, "vm.pp64.d"), * Src = rdVR64(B, IP, 1, "vm.pp64.s");
+		Value* IP = advIP(B, 4);
+		Value* DP = rdPR(B, IP, 0, "vm.pp64.d"), * Src = rdVR64(B, IP, 2, "vm.pp64.s");
 		stPR(B, DP, B.CreateIntToPtr(ldVR64(B, Src), PtrTy, "vm.pp64.v")); nextInsn(B);
 	}
 
@@ -595,32 +595,32 @@ void VMImpl::buildHandlersMem() {
 	//  OP_LOAD32 -- [dst:u8 ptrreg:u8] 
 	{
 		auto B = mkOpc(OP_LOAD32, "load32");
-		Value* IP = advIP(B, 2);
-		Value* Dst = rdVR(B, IP, 0, "vm.ld.d"), * PP = rdPR(B, IP, 1, "vm.ld.p");
+		Value* IP = advIP(B, 4);
+		Value* Dst = rdVR(B, IP, 0, "vm.ld.d"), * PP = rdPR(B, IP, 2, "vm.ld.p");
 		stVR(B, Dst, B.CreateLoad(I32Ty, ldPR(B, PP), "vm.ld.v")); nextInsn(B);
 	}
 
 	//  OP_LOAD64 -- [dst64:u8 ptrreg:u8] 
 	{
 		auto B = mkOpc(OP_LOAD64, "load64");
-		Value* IP = advIP(B, 2);
-		Value* Dst = rdVR64(B, IP, 0, "vm.ld64.d"), * PP = rdPR(B, IP, 1, "vm.ld64.p");
+		Value* IP = advIP(B, 4);
+		Value* Dst = rdVR64(B, IP, 0, "vm.ld64.d"), * PP = rdPR(B, IP, 2, "vm.ld64.p");
 		stVR64(B, Dst, B.CreateLoad(I64Ty, ldPR(B, PP), "vm.ld64.v")); nextInsn(B);
 	}
 
 	//  OP_STORE32 -- [val:u8 ptrreg:u8] 
 	{
 		auto B = mkOpc(OP_STORE32, "store32");
-		Value* IP = advIP(B, 2);
-		Value* VR = rdVR(B, IP, 0, "vm.st.v"), * PP = rdPR(B, IP, 1, "vm.st.p");
+		Value* IP = advIP(B, 4);
+		Value* VR = rdVR(B, IP, 0, "vm.st.v"), * PP = rdPR(B, IP, 2, "vm.st.p");
 		B.CreateStore(ldVR(B, VR), ldPR(B, PP)); nextInsn(B);
 	}
 
 	//  OP_STORE64 -- [val64:u8 ptrreg:u8] 
 	{
 		auto B = mkOpc(OP_STORE64, "store64");
-		Value* IP = advIP(B, 2);
-		Value* VIdx = rdVR64(B, IP, 0, "vm.st64.v"), * PP = rdPR(B, IP, 1, "vm.st64.p");
+		Value* IP = advIP(B, 4);
+		Value* VIdx = rdVR64(B, IP, 0, "vm.st64.v"), * PP = rdPR(B, IP, 2, "vm.st64.p");
 		B.CreateStore(ldVR64(B, VIdx), ldPR(B, PP)); nextInsn(B);
 	}
 
@@ -628,11 +628,11 @@ void VMImpl::buildHandlersMem() {
 	// Byte offset = vreg[idx] * elemsz.  Interpreter always operates in bytes.
 	{
 		auto B = mkOpc(OP_GEP, "gep");
-		Value* IP = advIP(B, 5);   // 3 reg bytes + 2 elemsz bytes
-		Value* DP = rdPR(B, IP, 0, "vm.gp.d"), * BP = rdPR(B, IP, 1, "vm.gp.b"), * Idx = rdVR(B, IP, 2, "vm.gp.i");
-		// Reconstruct elemsz (plain u16le, not obfuscated ├ö├ç├Â it's a stride constant)
-		Value* ELo = B.CreateZExt(loadBC(B, IP, 3, "vm.gp.el"), I64Ty, "vm.gp.elo");
-		Value* EHi = B.CreateZExt(loadBC(B, IP, 4, "vm.gp.eh"), I64Ty, "vm.gp.ehi");
+		Value* IP = advIP(B, 8);   // 3 reg u16 + 2 elemsz bytes
+		Value* DP = rdPR(B, IP, 0, "vm.gp.d"), * BP = rdPR(B, IP, 2, "vm.gp.b"), * Idx = rdVR(B, IP, 4, "vm.gp.i");
+		// Reconstruct elemsz (plain u16le stride)
+		Value* ELo = B.CreateZExt(loadBC(B, IP, 6, "vm.gp.el"), I64Ty, "vm.gp.elo");
+		Value* EHi = B.CreateZExt(loadBC(B, IP, 7, "vm.gp.eh"), I64Ty, "vm.gp.ehi");
 		Value* ESz = B.CreateOr(ELo, B.CreateShl(EHi, B.getInt64(8), "vm.gp.es"), "vm.gp.esz");
 		// Byte offset = (i64)idx_value * elemsz
 		Value* IdxVal = B.CreateSExt(ldVR(B, Idx), I64Ty, "vm.gp.iv");
@@ -643,11 +643,11 @@ void VMImpl::buildHandlersMem() {
 	//  OP_GEP64 -- [dstp:u8 basep:u8 idx64:u8 elemsz:u16le] 
 	{
 		auto B = mkOpc(OP_GEP64, "gep64");
-		Value* IP = advIP(B, 5);
-		Value* DP = rdPR(B, IP, 0, "vm.gp64.d"), * BP = rdPR(B, IP, 1, "vm.gp64.b");
-		Value* Idx = rdVR64(B, IP, 2, "vm.gp64.i");
-		Value* ELo = B.CreateZExt(loadBC(B, IP, 3, "vm.gp64.el"), I64Ty, "vm.gp64.elo");
-		Value* EHi = B.CreateZExt(loadBC(B, IP, 4, "vm.gp64.eh"), I64Ty, "vm.gp64.ehi");
+		Value* IP = advIP(B, 8);
+		Value* DP = rdPR(B, IP, 0, "vm.gp64.d"), * BP = rdPR(B, IP, 2, "vm.gp64.b");
+		Value* Idx = rdVR64(B, IP, 4, "vm.gp64.i");
+		Value* ELo = B.CreateZExt(loadBC(B, IP, 6, "vm.gp64.el"), I64Ty, "vm.gp64.elo");
+		Value* EHi = B.CreateZExt(loadBC(B, IP, 7, "vm.gp64.eh"), I64Ty, "vm.gp64.ehi");
 		Value* ESz = B.CreateOr(ELo, B.CreateShl(EHi, B.getInt64(8), "vm.gp64.es"), "vm.gp64.esz");
 		Value* IdxVal = ldVR64(B, Idx);
 		Value* ByteOff = B.CreateMul(IdxVal, ESz, "vm.gp64.bo");
@@ -659,36 +659,36 @@ void VMImpl::buildHandlersMem() {
 	// LOAD/STORE -- 8/16:
 	{
 		auto B = mkOpc(OP_LOAD8, "load8");
-		Value* IP = advIP(B, 2);
+		Value* IP = advIP(B, 4);
 		Value* Dst = rdVR(B, IP, 0, "vm.ld8.d");
-		Value* PP = rdPR(B, IP, 1, "vm.ld8.p");
+		Value* PP = rdPR(B, IP, 2, "vm.ld8.p");
 		Value* V8 = B.CreateLoad(I8Ty, ldPR(B, PP), "vm.ld8.v");
 		stVR(B, Dst, B.CreateZExt(V8, I32Ty, "vm.ld8.z"));
 		nextInsn(B);
 	}
 	{
 		auto B = mkOpc(OP_STORE8, "store8");
-		Value* IP = advIP(B, 2);
+		Value* IP = advIP(B, 4);
 		Value* VIdx = rdVR(B, IP, 0, "vm.st8.v");
-		Value* PP = rdPR(B, IP, 1, "vm.st8.p");
+		Value* PP = rdPR(B, IP, 2, "vm.st8.p");
 		Value* V8 = B.CreateTrunc(ldVR(B, VIdx), I8Ty, "vm.st8.t");
 		B.CreateStore(V8, ldPR(B, PP));
 		nextInsn(B);
 	}
 	{
 		auto B = mkOpc(OP_LOAD16, "load16");
-		Value* IP = advIP(B, 2);
+		Value* IP = advIP(B, 4);
 		Value* Dst = rdVR(B, IP, 0, "vm.ld16.d");
-		Value* PP = rdPR(B, IP, 1, "vm.ld16.p");
+		Value* PP = rdPR(B, IP, 2, "vm.ld16.p");
 		Value* V16 = B.CreateLoad(I16Ty, ldPR(B, PP), "vm.ld16.v");
 		stVR(B, Dst, B.CreateZExt(V16, I32Ty, "vm.ld16.z"));
 		nextInsn(B);
 	}
 	{
 		auto B = mkOpc(OP_STORE16, "store16");
-		Value* IP = advIP(B, 2);
+		Value* IP = advIP(B, 4);
 		Value* VIdx = rdVR(B, IP, 0, "vm.st16.v");
-		Value* PP = rdPR(B, IP, 1, "vm.st16.p");
+		Value* PP = rdPR(B, IP, 2, "vm.st16.p");
 		Value* V16 = B.CreateTrunc(ldVR(B, VIdx), I16Ty, "vm.st16.t");
 		B.CreateStore(V16, ldPR(B, PP));
 		nextInsn(B);
@@ -698,18 +698,18 @@ void VMImpl::buildHandlersMem() {
 	// LOAD/STORE -- PTR:
 	{
 		auto B = mkOpc(OP_LOADPTR, "loadptr");
-		Value* IP = advIP(B, 2);
+		Value* IP = advIP(B, 4);
 		Value* Dst = rdPR(B, IP, 0, "vm.lp.d");
-		Value* PP = rdPR(B, IP, 1, "vm.lp.p");
+		Value* PP = rdPR(B, IP, 2, "vm.lp.p");
 		Value* V = B.CreateLoad(PtrTy, ldPR(B, PP), "vm.lp.v");
 		stPR(B, Dst, V);
 		nextInsn(B);
 	}
 	{
 		auto B = mkOpc(OP_STOREPTR, "storeptr");
-		Value* IP = advIP(B, 2);
+		Value* IP = advIP(B, 4);
 		Value* VIdx = rdPR(B, IP, 0, "vm.sp.v");
-		Value* PP = rdPR(B, IP, 1, "vm.sp.p");
+		Value* PP = rdPR(B, IP, 2, "vm.sp.p");
 		B.CreateStore(ldPR(B, VIdx), ldPR(B, PP));
 		nextInsn(B);
 	}
@@ -731,8 +731,8 @@ void VMImpl::buildHandlersControl() {
 	//  OP_JMPC -- [cond:u8 tgt_t:u32 tgt_f:u32] 
 	{
 		auto B = mkOpc(OP_JMPC, "jmpc");
-		Value* IP = advIP(B, 9);
-		Value* Cond = rdVR(B, IP, 0, "vm.jc.c"), * Tt = rdU32(B, IP, 1, "vm.jc.t"), * Tf = rdU32(B, IP, 5, "vm.jc.f");
+		Value* IP = advIP(B, 10);
+		Value* Cond = rdVR(B, IP, 0, "vm.jc.c"), * Tt = rdU32(B, IP, 2, "vm.jc.t"), * Tf = rdU32(B, IP, 6, "vm.jc.f");
 		Value* Bool = B.CreateICmpNE(ldVR(B, Cond), B.getInt32(0), "vm.jc.b");
 		Value* Sel = B.CreateSelect(Bool, Tt, Tf, "vm.jc.s");
 		if (BlindTargets) Sel = B.CreateXor(Sel, tgtKeyIR(B, "vm.jc"), "vm.jc.ub");
@@ -752,15 +752,15 @@ void VMImpl::buildHandlersControl() {
 		Value* CondIdx = rdVR(B, CurIP, 0, "vm.sw.ci");
 		Value* CondVal = ldVR(B, CondIdx);
 
-		// ncases = u16le at offsets 1..2 (plain)
-		Value* NLo = B.CreateZExt(loadBC(B, CurIP, 1, "vm.sw.nl"), I32Ty, "vm.sw.nlo");
-		Value* NHi = B.CreateZExt(loadBC(B, CurIP, 2, "vm.sw.nh"), I32Ty, "vm.sw.nhi");
+		// ncases = u16le at offsets 2..3 (plain); cond is u16 at 0..1
+		Value* NLo = B.CreateZExt(loadBC(B, CurIP, 2, "vm.sw.nl"), I32Ty, "vm.sw.nlo");
+		Value* NHi = B.CreateZExt(loadBC(B, CurIP, 3, "vm.sw.nh"), I32Ty, "vm.sw.nhi");
 		Value* NCases = B.CreateOr(NLo, B.CreateShl(NHi, B.getInt32(8), "vm.sw.ns"), "vm.sw.nc");
 
-		Value* DefT = rdU32(B, CurIP, 3, "vm.sw.df");
+		Value* DefT = rdU32(B, CurIP, 4, "vm.sw.df");
 
-		// Advance IP past the whole switch payload: 7 + 8*ncases bytes
-		Value* Adv = B.CreateAdd(B.getInt32(7),
+		// Advance IP past the whole switch payload: 8 + 8*ncases bytes
+		Value* Adv = B.CreateAdd(B.getInt32(8),
 			B.CreateMul(NCases, B.getInt32(8), "vm.sw.mul"),
 			"vm.sw.adv");
 		B.CreateStore(B.CreateAdd(CurIP, Adv, "vm.sw.nip"), VMIP)->setVolatile(true);
@@ -782,8 +782,8 @@ void VMImpl::buildHandlersControl() {
 		LB.CreateCondBr(More, BodyBB, DoneBB);
 
 		IRBuilder<> BB(BodyBB);
-		// Off = 7 + i*8
-		Value* Off = BB.CreateAdd(BB.getInt32(7),
+		// Off = 8 + i*8
+		Value* Off = BB.CreateAdd(BB.getInt32(8),
 			BB.CreateMul(I, BB.getInt32(8), "vm.sw.os"),
 			"vm.sw.off");
 		Value* CaseV = rdU32Dyn(BB, CurIP, Off, "vm.sw.cv");
@@ -824,7 +824,7 @@ void VMImpl::buildHandlersControl() {
 
 	{
 		auto B = mkOpc(OP_RET_INT, "ret_int");
-		Value* IP = advIP(B, 1);
+		Value* IP = advIP(B, 2);
 		if (SharedEngineMode) {
 			rdVR(B, IP, 0, "vm.ri.s");  // consume operand
 			B.CreateRetVoid();
@@ -851,7 +851,7 @@ void VMImpl::buildHandlersControl() {
 
 	{
 		auto B = mkOpc(OP_RET_PTR, "ret_ptr");
-		Value* IP = advIP(B, 1);
+		Value* IP = advIP(B, 2);
 		if (SharedEngineMode) {
 			rdPR(B, IP, 0, "vm.rp.s");
 			B.CreateRetVoid();
@@ -882,12 +882,12 @@ void VMImpl::buildHandlersFloat() {
 	// OP_LOADI_F -- [dst_fr:u8 imm:f64le]    freg[dst] = imm 
 	{
 		auto B = mkOpc(OP_LOADI_F, "loadi_f");
-		Value* IP = advIP(B, 9);  // 1 dst + 8 bytes of f64
+		Value* IP = advIP(B, 10);  // 2 dst + 8 bytes of f64
 		Value* Dst = rdFR(B, IP, 0, "vm.lif.d");
 		// Reconstruct f64 from 8 LE bytes
 		Value* Bits = B.getInt64(0);
 		for (unsigned i = 0; i < 8; ++i) {
-			Value* ByteV = B.CreateZExt(loadBC(B, IP, 1 + i, "vm.lif.b"), I64Ty, "vm.lif.bz");
+			Value* ByteV = B.CreateZExt(loadBC(B, IP, 2 + i, "vm.lif.b"), I64Ty, "vm.lif.bz");
 			if (i) ByteV = B.CreateShl(ByteV, B.getInt64(i * 8), "vm.lif.bs");
 			Bits = B.CreateOr(Bits, ByteV, "vm.lif.or");
 		}
@@ -899,8 +899,8 @@ void VMImpl::buildHandlersFloat() {
 	// OP_MOVR_F -- [dst_fr:u8 src_fr:u8]  freg[dst] = freg[src] 
 	{
 		auto B = mkOpc(OP_MOVR_F, "movr_f");
-		Value* IP = advIP(B, 2);
-		stFR(B, rdFR(B, IP, 0, "vm.mrf.d"), ldFR(B, rdFR(B, IP, 1, "vm.mrf.s")));
+		Value* IP = advIP(B, 4);
+		stFR(B, rdFR(B, IP, 0, "vm.mrf.d"), ldFR(B, rdFR(B, IP, 2, "vm.mrf.s")));
 		nextInsn(B);
 	}
 
@@ -911,11 +911,11 @@ void VMImpl::buildHandlersFloat() {
 	// semantics exactly.
 	{
 		auto B = mkOpc(OP_BINOP_F, "binop_f");
-		Value* IP = advIP(B, 4);
+		Value* IP = advIP(B, 7);
 		Value* Dst = rdFR(B, IP, 0, "vm.bof.d");
-		Value* AIdx = rdFR(B, IP, 1, "vm.bof.a");
-		Value* BIdx = rdFR(B, IP, 2, "vm.bof.b");
-		Value* Sub8 = rdByte(B, IP, 3, "vm.bof.op");   // raw byte incl. bit7
+		Value* AIdx = rdFR(B, IP, 2, "vm.bof.a");
+		Value* BIdx = rdFR(B, IP, 4, "vm.bof.b");
+		Value* Sub8 = rdByte(B, IP, 6, "vm.bof.op");   // raw byte incl. bit7
 		Value* AV = ldFR(B, AIdx), * BV = ldFR(B, BIdx);
 
 		if (NestedVM && opcodeNests(OP_BINOP_F)) {
@@ -978,11 +978,11 @@ void VMImpl::buildHandlersFloat() {
 	// fcmp executes per dispatch.  No speculative evaluation of all 14 branches.
 	{
 		auto B = mkOpc(OP_FCMP, "fcmp");
-		Value* IP = advIP(B, 4);
+		Value* IP = advIP(B, 7);
 		Value* Dst = rdVR(B, IP, 0, "vm.fcp.d");
-		Value* AIdx = rdFR(B, IP, 1, "vm.fcp.a");
-		Value* BIdx = rdFR(B, IP, 2, "vm.fcp.b");
-		Value* Pred = rdByte(B, IP, 3, "vm.fcp.p");
+		Value* AIdx = rdFR(B, IP, 2, "vm.fcp.a");
+		Value* BIdx = rdFR(B, IP, 4, "vm.fcp.b");
+		Value* Pred = rdByte(B, IP, 6, "vm.fcp.p");
 		Value* AV = ldFR(B, AIdx);
 		Value* BV = ldFR(B, BIdx);
 
@@ -1047,10 +1047,10 @@ void VMImpl::buildHandlersFloat() {
 	// FK_FPTRUNC: -- round to f32 precision via fptrunc+fpext.
 	{
 		auto B = mkOpc(OP_FCAST_FF, "fcast_ff");
-		Value* IP = advIP(B, 3);
+		Value* IP = advIP(B, 5);
 		Value* Dst = rdFR(B, IP, 0, "vm.cff.d");
-		Value* SV = ldFR(B, rdFR(B, IP, 1, "vm.cff.s"));
-		Value* Kind = rdByte(B, IP, 2, "vm.cff.k");
+		Value* SV = ldFR(B, rdFR(B, IP, 2, "vm.cff.s"));
+		Value* Kind = rdByte(B, IP, 4, "vm.cff.k");
 		Value* Narrow = B.CreateFPExt(
 			B.CreateFPTrunc(SV, Type::getFloatTy(Ctx), "vm.cff.nt"), DoubleTy, "vm.cff.ne");
 		Value* IsExt = B.CreateICmpEQ(Kind, B.getInt32(FK_FPEXT), "vm.cff.ie");
@@ -1061,10 +1061,10 @@ void VMImpl::buildHandlersFloat() {
 	//  OP_FCAST_FV --  [dst_vr:u8 src_fr:u8 kind:u8]  freg→vreg i32  (fptosi / fptoui) 
 	{
 		auto B = mkOpc(OP_FCAST_FV, "fcast_fv");
-		Value* IP = advIP(B, 3);
+		Value* IP = advIP(B, 5);
 		Value* Dst = rdVR(B, IP, 0, "vm.cfv.d");
-		Value* SV = ldFR(B, rdFR(B, IP, 1, "vm.cfv.s"));
-		Value* Kind = rdByte(B, IP, 2, "vm.cfv.k");
+		Value* SV = ldFR(B, rdFR(B, IP, 2, "vm.cfv.s"));
+		Value* Kind = rdByte(B, IP, 4, "vm.cfv.k");
 		Value* SI = B.CreateFPToSI(SV, I32Ty, "vm.cfv.si");
 		Value* UI = B.CreateFPToUI(SV, I32Ty, "vm.cfv.ui");
 		Value* IsS = B.CreateICmpEQ(Kind, B.getInt32(FK_FPTOSI), "vm.cfv.is");
@@ -1075,10 +1075,10 @@ void VMImpl::buildHandlersFloat() {
 	// OP_FCAST_FV64 -- [dst_vr64:u8 src_fr:u8 kind:u8]  freg→vreg64 i64 
 	{
 		auto B = mkOpc(OP_FCAST_FV64, "fcast_fv64");
-		Value* IP = advIP(B, 3);
+		Value* IP = advIP(B, 5);
 		Value* Dst = rdVR64(B, IP, 0, "vm.cfv64.d");
-		Value* SV = ldFR(B, rdFR(B, IP, 1, "vm.cfv64.s"));
-		Value* Kind = rdByte(B, IP, 2, "vm.cfv64.k");
+		Value* SV = ldFR(B, rdFR(B, IP, 2, "vm.cfv64.s"));
+		Value* Kind = rdByte(B, IP, 4, "vm.cfv64.k");
 		Value* SI = B.CreateFPToSI(SV, I64Ty, "vm.cfv64.si");
 		Value* UI = B.CreateFPToUI(SV, I64Ty, "vm.cfv64.ui");
 		Value* IsS = B.CreateICmpEQ(Kind, B.getInt32(FK_FPTOSI64), "vm.cfv64.is");
@@ -1090,10 +1090,10 @@ void VMImpl::buildHandlersFloat() {
 	//  kind bit 7 = FCAST_F32_FLAG: round f64 result to f32 precision.
 	{
 		auto B = mkOpc(OP_FCAST_VF, "fcast_vf");
-		Value* IP = advIP(B, 3);
+		Value* IP = advIP(B, 5);
 		Value* Dst = rdFR(B, IP, 0, "vm.cvf.d");
-		Value* SV = ldVR(B, rdVR(B, IP, 1, "vm.cvf.s"));
-		Value* Kind = rdByte(B, IP, 2, "vm.cvf.k");
+		Value* SV = ldVR(B, rdVR(B, IP, 2, "vm.cvf.s"));
+		Value* Kind = rdByte(B, IP, 4, "vm.cvf.k");
 		Value * KindOp = B.CreateAnd(Kind, B.getInt32(0x7F), "vm.cvf.kop");
 		Value * IsF32 = B.CreateICmpNE(
 			B.CreateAnd(Kind, B.getInt32(0x80)), B.getInt32(0), "vm.cvf.f32");
@@ -1112,10 +1112,10 @@ void VMImpl::buildHandlersFloat() {
 	//  kind bit 7 = FCAST_F32_FLAG: round f64 result to f32 precision.
 	{
 		auto B = mkOpc(OP_FCAST_V64F, "fcast_v64f");
-		Value* IP = advIP(B, 3);
+		Value* IP = advIP(B, 5);
 		Value* Dst = rdFR(B, IP, 0, "vm.cv64f.d");
-		Value* SV = ldVR64(B, rdVR64(B, IP, 1, "vm.cv64f.s"));
-		Value* Kind = rdByte(B, IP, 2, "vm.cv64f.k");
+		Value* SV = ldVR64(B, rdVR64(B, IP, 2, "vm.cv64f.s"));
+		Value* Kind = rdByte(B, IP, 4, "vm.cv64f.k");
 		Value * KindOp = B.CreateAnd(Kind, B.getInt32(0x7F), "vm.cv64f.kop");
 		Value * IsF32 = B.CreateICmpNE(
 			B.CreateAnd(Kind, B.getInt32(0x80)), B.getInt32(0), "vm.cv64f.f32");
@@ -1137,9 +1137,9 @@ void VMImpl::buildHandlersFloat() {
 	// results (reads 8 bytes from a 4-byte slot). Use double in IR for correct behaviour.
 	{
 		auto B = mkOpc(OP_LOAD_F, "load_f");
-		Value* IP = advIP(B, 2);
+		Value* IP = advIP(B, 4);
 		Value* Dst = rdFR(B, IP, 0, "vm.ldf.d");
-		Value* PP = rdPR(B, IP, 1, "vm.ldf.p");
+		Value* PP = rdPR(B, IP, 2, "vm.ldf.p");
 		stFR(B, Dst, B.CreateLoad(DoubleTy, ldPR(B, PP), "vm.ldf.v"));
 		nextInsn(B);
 	}
@@ -1147,9 +1147,9 @@ void VMImpl::buildHandlersFloat() {
 	//  OP_STORE_F  [src_fr:u8 ptrreg:u8]    *ptr = freg[src] (f64) 
 	{
 		auto B = mkOpc(OP_STORE_F, "store_f");
-		Value* IP = advIP(B, 2);
+		Value* IP = advIP(B, 4);
 		Value* Src = rdFR(B, IP, 0, "vm.stf.s");
-		Value* PP = rdPR(B, IP, 1, "vm.stf.p");
+		Value* PP = rdPR(B, IP, 2, "vm.stf.p");
 		B.CreateStore(ldFR(B, Src), ldPR(B, PP));
 		nextInsn(B);
 	}
@@ -1160,9 +1160,9 @@ void VMImpl::buildHandlersFloat() {
 	// Used when the source IR has type float (not double) — e.g. float* function parameter.
 	{
 		auto B = mkOpc(OP_LOAD_F32, "load_f32");
-		Value* IP = advIP(B, 2);
+		Value* IP = advIP(B, 4);
 		Value* Dst = rdFR(B, IP, 0, "vm.ldf32.d");
-		Value* PP = rdPR(B, IP, 1, "vm.ldf32.p");
+		Value* PP = rdPR(B, IP, 2, "vm.ldf32.p");
 		Value* F32V = B.CreateLoad(Type::getFloatTy(Ctx), ldPR(B, PP), "vm.ldf32.v");
 		stFR(B, Dst, B.CreateFPExt(F32V, DoubleTy, "vm.ldf32.ext"));
 		nextInsn(B);
@@ -1173,9 +1173,9 @@ void VMImpl::buildHandlersFloat() {
 	// Used when the destination IR type is float — e.g. float* function parameter.
 	{
 		auto B = mkOpc(OP_STORE_F32, "store_f32");
-		Value* IP = advIP(B, 2);
+		Value* IP = advIP(B, 4);
 		Value* Src = rdFR(B, IP, 0, "vm.stf32.s");
-		Value* PP = rdPR(B, IP, 1, "vm.stf32.p");
+		Value* PP = rdPR(B, IP, 2, "vm.stf32.p");
 		Value* F32V = B.CreateFPTrunc(ldFR(B, Src), Type::getFloatTy(Ctx), "vm.stf32.tr");
 		B.CreateStore(F32V, ldPR(B, PP));
 		nextInsn(B);
@@ -1184,7 +1184,7 @@ void VMImpl::buildHandlersFloat() {
 	//  OP_RET_F  [src_fr:u8]    return freg[src] 
 	{
 		auto B = mkOpc(OP_RET_F, "ret_f");
-		Value* IP = advIP(B, 1);
+		Value* IP = advIP(B, 2);
 		if (SharedEngineMode) {
 			rdFR(B, IP, 0, "vm.rf.s");
 			B.CreateRetVoid();
@@ -1209,11 +1209,11 @@ void VMImpl::buildHandlersFloat() {
 	// OP_SELECT_F  [dst_fr:u8 cond_vr:u8 t_fr:u8 f_fr:u8] 
 	{
 		auto B = mkOpc(OP_SELECT_F, "select_f");
-		Value* IP = advIP(B, 4);
+		Value* IP = advIP(B, 8);
 		Value* Dst = rdFR(B, IP, 0, "vm.slf.d");
-		Value* Cond = rdVR(B, IP, 1, "vm.slf.c");
-		Value* TV = ldFR(B, rdFR(B, IP, 2, "vm.slf.t"));
-		Value* FV = ldFR(B, rdFR(B, IP, 3, "vm.slf.f"));
+		Value* Cond = rdVR(B, IP, 2, "vm.slf.c");
+		Value* TV = ldFR(B, rdFR(B, IP, 4, "vm.slf.t"));
+		Value* FV = ldFR(B, rdFR(B, IP, 6, "vm.slf.f"));
 		Value* Bool = B.CreateICmpNE(ldVR(B, Cond), B.getInt32(0), "vm.slf.b");
 		stFR(B, Dst, B.CreateSelect(Bool, TV, FV, "vm.slf.r"));
 		nextInsn(B);
@@ -1224,9 +1224,9 @@ void VMImpl::buildHandlersFloat() {
 	//  OP_FNEG  [dst_fr:u8 src_fr:u8]  
 	{
 		auto B = mkOpc(OP_FNEG, "fneg");
-		Value* IP = advIP(B, 2);
+		Value* IP = advIP(B, 4);
 		Value* Dst = rdFR(B, IP, 0, "vm.neg.d");
-		Value* SV = ldFR(B, rdFR(B, IP, 1, "vm.neg.s"));
+		Value* SV = ldFR(B, rdFR(B, IP, 2, "vm.neg.s"));
 		stFR(B, Dst, B.CreateFNeg(SV, "vm.neg.r"));
 		nextInsn(B);
 	}
@@ -1251,16 +1251,16 @@ void VMImpl::buildCall2(VMOp Opc, const Twine& Name, llvm::VMEngine::RetKind2 RK
 
 	const bool IsVoid = (RK == RK2_VOID);
 	const bool IsPair = (RK == RK2_PAIR);
-	// PAIR encoding: opc dstp dst64 fn nargs [args...] — Base=2 dst bytes.
-	const unsigned Base = IsVoid ? 0u : (IsPair ? 2u : 1u);
+	// PAIR encoding: opc dstp:u16 dst64:u16 fn nargs [args:u16...] — Base=dst operand bytes.
+	const unsigned Base = IsVoid ? 0u : (IsPair ? 4u : 2u);
 
 	Value* DstSlot = nullptr;
 	Value* DstSlot64 = nullptr;
 	if (IsPair) {
-		DstSlot = deobf(B, loadBC(B, CurIP, 0, "vm.cl.drp"), MaskPR, "vm.cl.dsp");
-		DstSlot64 = deobf(B, loadBC(B, CurIP, 1, "vm.cl.dr64"), MaskVR64, "vm.cl.ds64");
+		DstSlot = deobf(B, loadBC16(B, CurIP, 0, "vm.cl.drp"), MaskPR, "vm.cl.dsp");
+		DstSlot64 = deobf(B, loadBC16(B, CurIP, 2, "vm.cl.dr64"), MaskVR64, "vm.cl.ds64");
 	} else if (!IsVoid) {
-		Value* DR = loadBC(B, CurIP, 0, "vm.cl.dr");
+		Value* DR = loadBC16(B, CurIP, 0, "vm.cl.dr");
 		Value* DMask = (RK == RK2_PTR) ? MaskPR
 			: (RK == RK2_I64) ? MaskVR64
 			: (RK == RK2_F64) ? MaskFR : MaskVR;
@@ -1298,7 +1298,7 @@ void VMImpl::buildCall2(VMOp Opc, const Twine& Name, llvm::VMEngine::RetKind2 RK
 	auto* CalMerge = BasicBlock::Create(Ctx, "vm.cl.cm", HFn);
 	B.CreateCondBr(IsInd, IndBB, DirBB);
 	IRBuilder<> IB(IndBB);
-	Value* IndSlot = deobf(IB, loadBC(IB, CurIP, Base + 2, "vm.cl.ib"), MaskPR, "vm.cl.isp");
+	Value* IndSlot = deobf(IB, loadBC16(IB, CurIP, Base + 2, "vm.cl.ib"), MaskPR, "vm.cl.isp");
 	Value* IndCallee = ldPR(IB, IndSlot);
 	IB.CreateBr(CalMerge);
 	IRBuilder<> DB(DirBB);
@@ -1323,13 +1323,14 @@ void VMImpl::buildCall2(VMOp Opc, const Twine& Name, llvm::VMEngine::RetKind2 RK
 		FTyIdx = B.CreateZExt(FTyIdxByte, I32Ty, "vm.cl.ftyx");
 	}
 
-	// Pre-load all MaxArgs arg slots. Direct args start at Base+2; indirect
-	// args start at Base+3 (Base+2 is the callee preg).
-	Value* ArgBase = B.CreateAdd(B.getInt32(Base + 2),
-		B.CreateZExt(IsInd, I32Ty, "vm.cl.indz"), "vm.cl.ab0");
+	// Pre-load all MaxArgs arg slots (u16le). Direct args start at Base+2;
+	// indirect args start at Base+4 (Base+2 is the callee preg u16).
+	Value* IndBytes = B.CreateMul(B.CreateZExt(IsInd, I32Ty, "vm.cl.indz"), B.getInt32(2), "vm.cl.indb");
+	Value* ArgBase = B.CreateAdd(B.getInt32(Base + 2), IndBytes, "vm.cl.ab0");
 	SmallVector<Value*, MaxArgs> PVals, IVals, I64Vs, FregVals;
 	for (unsigned i = 0; i < MaxArgs; ++i) {
-		Value* AB = loadBCDyn(B, CurIP, B.CreateAdd(ArgBase, B.getInt32(i), "vm.cl.ao"), "vm.cl.ab");
+		Value* AOff = B.CreateAdd(ArgBase, B.CreateMul(B.getInt32(i), B.getInt32(2), "vm.cl.as"), "vm.cl.ao");
+		Value* AB = loadBC16Dyn(B, CurIP, AOff, "vm.cl.ab");
 		Value* PIdx = deobf(B, AB, MaskPR, "vm.cl.pi");
 		Value* VIdx = deobf(B, AB, MaskVR, "vm.cl.vi");
 		Value* V64I = deobf(B, AB, MaskVR64, "vm.cl.v64i");
@@ -1342,10 +1343,11 @@ void VMImpl::buildCall2(VMOp Opc, const Twine& Name, llvm::VMEngine::RetKind2 RK
 		FregVals.push_back(ldFR(B, FIdx));
 	}
 
-	// Advance IP: Base + 2 header bytes + optional indirect byte + nargs.
+	// Advance IP: Base + 2 header bytes + optional indirect u16 + nargs*u16.
+	Value* ArgBytes = B.CreateMul(NArgs, B.getInt32(2), "vm.cl.argb");
 	Value* Adv = B.CreateAdd(
-		B.CreateAdd(B.getInt32(Base + 2), NArgs, "vm.cl.adv0"),
-		B.CreateZExt(IsInd, I32Ty, "vm.cl.indz2"), "vm.cl.adv");
+		B.CreateAdd(B.getInt32(Base + 2), ArgBytes, "vm.cl.adv0"),
+		IndBytes, "vm.cl.adv");
 	B.CreateStore(B.CreateAdd(CurIP, Adv, "vm.cl.nb"), VMIP)->setVolatile(true);
 
 

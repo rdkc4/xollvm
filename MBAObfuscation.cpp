@@ -255,20 +255,17 @@ namespace {
 		Function& F = PCtx.F;
 		FunctionObfContext& Ctx = PCtx.FOC;
 
-		// VM bytecode uses a u8 slot index (≤254 live). Full MBA on large
-		// funclib bodies (PopulateVsrc*, executeVOP*M*) inflates live SSA
-		// past that cap. When VM is co-enabled, keep MBA light so virtualize
-		// still succeeds — prefer VM coverage over MBA density.
+		// VM bytecode uses a u16le slot index (soft cap 4096). Full MBA on
+		// large funclib bodies still inflates live SSA; keep a mild throttle
+		// when VM is co-enabled so virtualize stays under the new ceiling.
 		if (PCtx.OC.isPassEnabled("vm") && maxSites > 0) {
-			// Empirically: 12 deep-MBA sites on ~600-inst VOP5MFma still
-			// pushes live vregs past u8; 8 sites stay ~140.
 			unsigned Cap = maxSites;
-			if (Ctx.NumInsts > 500)
-				Cap = 8;
-			else if (Ctx.NumInsts > 300)
-				Cap = 16;
-			else if (Ctx.NumInsts > 150)
-				Cap = 32;
+			if (Ctx.NumInsts > 2000)
+				Cap = 64;
+			else if (Ctx.NumInsts > 1000)
+				Cap = 128;
+			else if (Ctx.NumInsts > 500)
+				Cap = 256;
 			if (Cap < maxSites) {
 				maxSites = Cap;
 				if (ObfVerbose)

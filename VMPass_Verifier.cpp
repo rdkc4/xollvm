@@ -13,7 +13,7 @@ using namespace llvm;
 
 namespace llvm {
 
-	bool verifyBytecode(const BytecodeEmitter& E, uint8_t CTSalt, const VMOpcodeMap& OpMap,
+	bool verifyBytecode(const BytecodeEmitter& E, uint16_t CTSalt, const VMOpcodeMap& OpMap,
 		std::string& OutErr, uint32_t& OutBadIP,
 		uint32_t SaltFull, bool BlindTargets, bool KeyedDispatch) {
 		const auto& BC = E.BC;
@@ -54,7 +54,7 @@ namespace llvm {
 			return false;
 			};
 
-		auto decIdx = [&](uint8_t Raw) -> unsigned {
+		auto decIdx = [&](uint16_t Raw) -> unsigned {
 			return (unsigned)(Raw ^ CTSalt);
 			};
 
@@ -66,6 +66,9 @@ namespace llvm {
 
 		auto rdU16 = [&](uint32_t Off) -> uint16_t {
 			return (uint16_t)((uint16_t)BC[Off] | ((uint16_t)BC[Off + 1] << 8));
+			};
+		auto rdIdx = [&](uint32_t Off) -> unsigned {
+			return decIdx(rdU16(Off));
 			};
 		auto rdU32 = [&](uint32_t Off) -> uint32_t {
 			return (uint32_t)BC[Off] |
@@ -84,22 +87,20 @@ namespace llvm {
 			};
 
 
-		// shared CALL verifier body -- used by all CALL opcodes.
-		// Encoding: [dst?] fn:u8 nargs:u8 [arg:u8 * nargs]
-		// PAIR: [dstp dst64] fn nargs [args...]
-		// (flags/argtypes bytes removed -- FunctionType now comes from GVFTyIndices)
+		// shared CALL verifier — dst/args are u16le; fn/nargs remain u8
 		auto verifyCall = [&](uint32_t IP, unsigned DstKind) -> bool {
-			// DstKind: 0=void, 1=vreg, 2=preg, 3=vreg64, 4=freg, 5=pair(preg+vreg64)
 			const bool IsPair = (DstKind == 5);
 			const bool HasDst = (DstKind != 0);
-			uint32_t Hdr = IsPair ? 5u : (HasDst ? 4u : 3u);  // opc + dst(s) + fn + nargs
+			// opc(1) + dst bytes + fn(1) + nargs(1)
+			uint32_t DstBytes = IsPair ? 4u : (HasDst ? 2u : 0u);
+			uint32_t Hdr = 1u + DstBytes + 2u;
 			if (IP + Hdr > BC.size()) return fail(IP, "OP_CALL header truncated");
 			uint32_t Off = IP + 1;
 			if (IsPair) {
-				if (!chk(IP, "preg", decIdx(BC[Off++]), E.NPR)) return false;
-				if (!chk(IP, "vreg64", decIdx(BC[Off++]), E.NVR64)) return false;
+				if (!chk(IP, "preg", rdIdx(Off), E.NPR)) return false; Off += 2;
+				if (!chk(IP, "vreg64", rdIdx(Off), E.NVR64)) return false; Off += 2;
 			} else if (HasDst) {
-				unsigned DstIdx = decIdx(BC[Off++]);
+				unsigned DstIdx = rdIdx(Off); Off += 2;
 				switch (DstKind) {
 				case 1: if (!chk(IP, "vreg", DstIdx, E.NVR))    return false; break;
 				case 2: if (!chk(IP, "preg", DstIdx, E.NPR))    return false; break;
@@ -111,41 +112,36 @@ namespace llvm {
 			uint8_t  NArgsRaw = BC[Off + 1];
 			const bool Ind = (NArgsRaw & 0x80) != 0;
 			uint8_t  NArgs = (uint8_t)(NArgsRaw & 0x7F);
-			// no flags/ArgTypes bytes.
 			if (FnIdx >= E.CalleeTab.size())
 				return fail(IP, Twine("OP_CALL fn index out of range: ") + Twine((unsigned)FnIdx));
 			if (NArgs > kVMCallMaxArgs)
 				return fail(IP, Twine("OP_CALL nargs too large: ") + Twine((unsigned)NArgs));
 
-			uint32_t Extra = Ind ? 1u : 0u;
-			uint32_t Total = Hdr + Extra + (uint32_t)NArgs;
+			uint32_t Extra = Ind ? 2u : 0u;
+			uint32_t Total = Hdr + Extra + 2u * (uint32_t)NArgs;
 			if (IP + Total > BC.size())
 				return fail(IP, "OP_CALL args truncated");
 			uint32_t ArgBase = IP + Hdr;
 			if (Ind) {
-				if (!chk(IP, "preg", decIdx(BC[ArgBase]), E.NPR)) return false;
-				ArgBase += 1;
+				if (!chk(IP, "preg", rdIdx(ArgBase), E.NPR)) return false;
+				ArgBase += 2;
 			}
 			for (unsigned i = 0; i < NArgs; ++i) {
-				unsigned Idx = decIdx(BC[ArgBase + i]);
-				// arg register file is determined by FTy at runtime;
-				// verify conservatively that Idx is in range of at least one file.
+				unsigned Idx = rdIdx(ArgBase + 2u * i);
 				unsigned MaxSlots = std::max({ (unsigned)E.NVR, (unsigned)E.NVR64,
 				(unsigned)E.NPR, (unsigned)E.NFR });
 				if (!chk(IP, "arg", Idx, MaxSlots)) return false;
 			}
 			return true;
-			// caller advances IP by Total
-			(void)Total;  // suppress unused-warning
 			};
-		// Compute Total for IP advancement (same formula as inside verifyCall)
-		// NumDst: 0=void, 1=single dst, 2=pair
 		auto callTotal = [&](uint32_t IP, unsigned NumDst) -> uint32_t {
-			uint32_t Hdr = 3u + NumDst;  // opc + dst*NumDst + fn + nargs
-			uint32_t Off = IP + 1 + NumDst;
+			// NumDst: 0=void, 1=single, 2=pair — each dst is u16
+			uint32_t DstBytes = 2u * NumDst;
+			uint32_t Hdr = 1u + DstBytes + 2u;
+			uint32_t Off = IP + 1 + DstBytes;
 			uint8_t  NArgsRaw = BC[Off + 1];
-			uint32_t Extra = (NArgsRaw & 0x80) ? 1u : 0u;
-			return Hdr + Extra + (uint32_t)(NArgsRaw & 0x7F);
+			uint32_t Extra = (NArgsRaw & 0x80) ? 2u : 0u;
+			return Hdr + Extra + 2u * (uint32_t)(NArgsRaw & 0x7F);
 			};
 
 
@@ -160,227 +156,192 @@ namespace llvm {
 			VMOp Opc = OpMap.decode(Phys);
 			switch (Opc) {
 			case OP_LOADI: {
-				if (IP + 6 > BC.size()) return fail(IP, "OP_LOADI truncated");
-				if (!chk(IP, "vreg", decIdx(BC[IP + 1]), E.NVR)) return false;
-				IP += 6; break;
-			}
-			case OP_LOADI64: {
-				if (IP + 10 > BC.size()) return fail(IP, "OP_LOADI64 truncated");
-				if (!chk(IP, "vreg64", decIdx(BC[IP + 1]), E.NVR64)) return false;
-				IP += 10; break;
-			}
-			case OP_MOVR: {
-				if (IP + 3 > BC.size()) return fail(IP, "OP_MOVR truncated");
-				if (!chk(IP, "vreg", decIdx(BC[IP + 1]), E.NVR)) return false;
-				if (!chk(IP, "vreg", decIdx(BC[IP + 2]), E.NVR)) return false;
-				IP += 3; break;
-			}
-			case OP_BINOP: {
-				if (IP + 5 > BC.size()) return fail(IP, "OP_BINOP truncated");
-				if (!chk(IP, "vreg", decIdx(BC[IP + 1]), E.NVR)) return false;
-				if (!chk(IP, "vreg", decIdx(BC[IP + 2]), E.NVR)) return false;
-				if (!chk(IP, "vreg", decIdx(BC[IP + 3]), E.NVR)) return false;
-				IP += 5; break;
-			}
-			case OP_MULADD: {
-				if (IP + 5 > BC.size()) return fail(IP, "OP_MULADD truncated");
-				if (!chk(IP, "vreg", decIdx(BC[IP + 1]), E.NVR)) return false;
-				if (!chk(IP, "vreg", decIdx(BC[IP + 2]), E.NVR)) return false;
-				if (!chk(IP, "vreg", decIdx(BC[IP + 3]), E.NVR)) return false;
-				if (!chk(IP, "vreg", decIdx(BC[IP + 4]), E.NVR)) return false;
-				IP += 5; break;
-			}
-			case OP_SHLADD: {
-				if (IP + 5 > BC.size()) return fail(IP, "OP_SHLADD truncated");
-				if (!chk(IP, "vreg", decIdx(BC[IP + 1]), E.NVR)) return false;
-				if (!chk(IP, "vreg", decIdx(BC[IP + 2]), E.NVR)) return false;
-				if (!chk(IP, "vreg", decIdx(BC[IP + 3]), E.NVR)) return false;
-				if (!chk(IP, "vreg", decIdx(BC[IP + 4]), E.NVR)) return false;
-				IP += 5; break;
-			}
-			case OP_CMPSEL: {
-				if (IP + 7 > BC.size()) return fail(IP, "OP_CMPSEL truncated");
-				if (!chk(IP, "vreg", decIdx(BC[IP + 1]), E.NVR)) return false;  // dst
-				if (!chk(IP, "vreg", decIdx(BC[IP + 2]), E.NVR)) return false;  // a
-				if (!chk(IP, "vreg", decIdx(BC[IP + 3]), E.NVR)) return false;  // b
-				// BC[IP + 4] = pred byte (not a register index)
-				if (!chk(IP, "vreg", decIdx(BC[IP + 5]), E.NVR)) return false;  // t
-				if (!chk(IP, "vreg", decIdx(BC[IP + 6]), E.NVR)) return false;  // f
+				if (IP + 7 > BC.size()) return fail(IP, "OP_LOADI truncated");
+				if (!chk(IP, "vreg", rdIdx(IP + 1), E.NVR)) return false;
 				IP += 7; break;
 			}
-			case OP_ANDCMPZ: {
-				if (IP + 5 > BC.size()) return fail(IP, "OP_ANDCMPZ truncated");
-				if (!chk(IP, "vreg", decIdx(BC[IP + 1]), E.NVR)) return false;  // dst
-				if (!chk(IP, "vreg", decIdx(BC[IP + 2]), E.NVR)) return false;  // a
-				if (!chk(IP, "vreg", decIdx(BC[IP + 3]), E.NVR)) return false;  // b
-				// BC[IP + 4] = pred byte (EQ/NE, not a register index)
+			case OP_LOADI64: {
+				if (IP + 11 > BC.size()) return fail(IP, "OP_LOADI64 truncated");
+				if (!chk(IP, "vreg64", rdIdx(IP + 1), E.NVR64)) return false;
+				IP += 11; break;
+			}
+			case OP_MOVR: {
+				if (IP + 5 > BC.size()) return fail(IP, "OP_MOVR truncated");
+				if (!chk(IP, "vreg", rdIdx(IP + 1), E.NVR)) return false;
+				if (!chk(IP, "vreg", rdIdx(IP + 3), E.NVR)) return false;
 				IP += 5; break;
+			}
+			case OP_BINOP: {
+				if (IP + 8 > BC.size()) return fail(IP, "OP_BINOP truncated");
+				if (!chk(IP, "vreg", rdIdx(IP + 1), E.NVR)) return false;
+				if (!chk(IP, "vreg", rdIdx(IP + 3), E.NVR)) return false;
+				if (!chk(IP, "vreg", rdIdx(IP + 5), E.NVR)) return false;
+				IP += 8; break;
+			}
+			case OP_MULADD: {
+				if (IP + 9 > BC.size()) return fail(IP, "OP_MULADD truncated");
+				if (!chk(IP, "vreg", rdIdx(IP + 1), E.NVR)) return false;
+				if (!chk(IP, "vreg", rdIdx(IP + 3), E.NVR)) return false;
+				if (!chk(IP, "vreg", rdIdx(IP + 5), E.NVR)) return false;
+				if (!chk(IP, "vreg", rdIdx(IP + 7), E.NVR)) return false;
+				IP += 9; break;
+			}
+			case OP_SHLADD: {
+				if (IP + 9 > BC.size()) return fail(IP, "OP_SHLADD truncated");
+				if (!chk(IP, "vreg", rdIdx(IP + 1), E.NVR)) return false;
+				if (!chk(IP, "vreg", rdIdx(IP + 3), E.NVR)) return false;
+				if (!chk(IP, "vreg", rdIdx(IP + 5), E.NVR)) return false;
+				if (!chk(IP, "vreg", rdIdx(IP + 7), E.NVR)) return false;
+				IP += 9; break;
+			}
+			case OP_CMPSEL: {
+				if (IP + 12 > BC.size()) return fail(IP, "OP_CMPSEL truncated");
+				if (!chk(IP, "vreg", rdIdx(IP + 1), E.NVR)) return false;
+				if (!chk(IP, "vreg", rdIdx(IP + 3), E.NVR)) return false;
+				if (!chk(IP, "vreg", rdIdx(IP + 5), E.NVR)) return false;
+				if (!chk(IP, "vreg", rdIdx(IP + 8), E.NVR)) return false;
+				if (!chk(IP, "vreg", rdIdx(IP + 10), E.NVR)) return false;
+				IP += 12; break;
+			}
+			case OP_ANDCMPZ: {
+				if (IP + 8 > BC.size()) return fail(IP, "OP_ANDCMPZ truncated");
+				if (!chk(IP, "vreg", rdIdx(IP + 1), E.NVR)) return false;
+				if (!chk(IP, "vreg", rdIdx(IP + 3), E.NVR)) return false;
+				if (!chk(IP, "vreg", rdIdx(IP + 5), E.NVR)) return false;
+				IP += 8; break;
 			}
 			case OP_ICMP: {
-				if (IP + 5 > BC.size()) return fail(IP, "OP_ICMP truncated");
-				if (!chk(IP, "vreg", decIdx(BC[IP + 1]), E.NVR)) return false;
-				if (!chk(IP, "vreg", decIdx(BC[IP + 2]), E.NVR)) return false;
-				if (!chk(IP, "vreg", decIdx(BC[IP + 3]), E.NVR)) return false;
-				IP += 5; break;
+				if (IP + 8 > BC.size()) return fail(IP, "OP_ICMP truncated");
+				if (!chk(IP, "vreg", rdIdx(IP + 1), E.NVR)) return false;
+				if (!chk(IP, "vreg", rdIdx(IP + 3), E.NVR)) return false;
+				if (!chk(IP, "vreg", rdIdx(IP + 5), E.NVR)) return false;
+				IP += 8; break;
 			}
 			case OP_ICMP64: {
-				if (IP + 5 > BC.size()) return fail(IP, "OP_ICMP64 truncated");
-				if (!chk(IP, "vreg", decIdx(BC[IP + 1]), E.NVR)) return false;
-				if (!chk(IP, "vreg64", decIdx(BC[IP + 2]), E.NVR64)) return false;
-				if (!chk(IP, "vreg64", decIdx(BC[IP + 3]), E.NVR64)) return false;
-				IP += 5; break;
+				if (IP + 8 > BC.size()) return fail(IP, "OP_ICMP64 truncated");
+				if (!chk(IP, "vreg", rdIdx(IP + 1), E.NVR)) return false;
+				if (!chk(IP, "vreg64", rdIdx(IP + 3), E.NVR64)) return false;
+				if (!chk(IP, "vreg64", rdIdx(IP + 5), E.NVR64)) return false;
+				IP += 8; break;
 			}
 			case OP_ICMP_PTR: {
-				if (IP + 5 > BC.size()) return fail(IP, "OP_ICMP_PTR truncated");
-				if (!chk(IP, "vreg", decIdx(BC[IP + 1]), E.NVR)) return false;
-				if (!chk(IP, "preg", decIdx(BC[IP + 2]), E.NPR)) return false;
-				if (!chk(IP, "preg", decIdx(BC[IP + 3]), E.NPR)) return false;
-				IP += 5; break;
+				if (IP + 8 > BC.size()) return fail(IP, "OP_ICMP_PTR truncated");
+				if (!chk(IP, "vreg", rdIdx(IP + 1), E.NVR)) return false;
+				if (!chk(IP, "preg", rdIdx(IP + 3), E.NPR)) return false;
+				if (!chk(IP, "preg", rdIdx(IP + 5), E.NPR)) return false;
+				IP += 8; break;
 			}
 			case OP_CAST: {
-				if (IP + 4 > BC.size()) return fail(IP, "OP_CAST truncated");
-				if (!chk(IP, "vreg", decIdx(BC[IP + 1]), E.NVR)) return false;
-				if (!chk(IP, "vreg", decIdx(BC[IP + 2]), E.NVR)) return false;
-				IP += 4; break;
+				if (IP + 6 > BC.size()) return fail(IP, "OP_CAST truncated");
+				if (!chk(IP, "vreg", rdIdx(IP + 1), E.NVR)) return false;
+				if (!chk(IP, "vreg", rdIdx(IP + 3), E.NVR)) return false;
+				IP += 6; break;
 			}
 			case OP_CAST64: {
-				if (IP + 4 > BC.size()) return fail(IP, "OP_CAST64 truncated");
-				unsigned Kind = (unsigned)BC[IP + 3];
+				if (IP + 6 > BC.size()) return fail(IP, "OP_CAST64 truncated");
+				unsigned Kind = (unsigned)BC[IP + 5];
 				if (Kind <= (unsigned)C64_SEXT32) {
-					if (!chk(IP, "vreg64", decIdx(BC[IP + 1]), E.NVR64)) return false;
-					if (!chk(IP, "vreg", decIdx(BC[IP + 2]), E.NVR)) return false;
-				}
-				else if (Kind >= (unsigned)C64_TRUNC1 && Kind <= (unsigned)C64_TRUNC32) {
-					if (!chk(IP, "vreg", decIdx(BC[IP + 1]), E.NVR)) return false;
-					if (!chk(IP, "vreg64", decIdx(BC[IP + 2]), E.NVR64)) return false;
-				}
-				else {
+					if (!chk(IP, "vreg64", rdIdx(IP + 1), E.NVR64)) return false;
+					if (!chk(IP, "vreg", rdIdx(IP + 3), E.NVR)) return false;
+				} else if (Kind >= (unsigned)C64_TRUNC1 && Kind <= (unsigned)C64_TRUNC32) {
+					if (!chk(IP, "vreg", rdIdx(IP + 1), E.NVR)) return false;
+					if (!chk(IP, "vreg64", rdIdx(IP + 3), E.NVR64)) return false;
+				} else {
 					return fail(IP, Twine("OP_CAST64 invalid kind ") + Twine(Kind));
 				}
-				IP += 4; break;
+				IP += 6; break;
 			}
 			case OP_PTRTOINT: {
-				if (IP + 3 > BC.size()) return fail(IP, "OP_PTRTOINT truncated");
-				if (!chk(IP, "vreg", decIdx(BC[IP + 1]), E.NVR)) return false;
-				if (!chk(IP, "preg", decIdx(BC[IP + 2]), E.NPR)) return false;
-				IP += 3; break;
+				if (IP + 5 > BC.size()) return fail(IP, "OP_PTRTOINT truncated");
+				if (!chk(IP, "vreg", rdIdx(IP + 1), E.NVR)) return false;
+				if (!chk(IP, "preg", rdIdx(IP + 3), E.NPR)) return false;
+				IP += 5; break;
 			}
 			case OP_PTRTOINT64: {
-				if (IP + 3 > BC.size()) return fail(IP, "OP_PTRTOINT64 truncated");
-				if (!chk(IP, "vreg64", decIdx(BC[IP + 1]), E.NVR64)) return false;
-				if (!chk(IP, "preg", decIdx(BC[IP + 2]), E.NPR)) return false;
-				IP += 3; break;
+				if (IP + 5 > BC.size()) return fail(IP, "OP_PTRTOINT64 truncated");
+				if (!chk(IP, "vreg64", rdIdx(IP + 1), E.NVR64)) return false;
+				if (!chk(IP, "preg", rdIdx(IP + 3), E.NPR)) return false;
+				IP += 5; break;
 			}
 			case OP_INTTOPTR: {
-				if (IP + 3 > BC.size()) return fail(IP, "OP_INTTOPTR truncated");
-				if (!chk(IP, "preg", decIdx(BC[IP + 1]), E.NPR)) return false;
-				if (!chk(IP, "vreg", decIdx(BC[IP + 2]), E.NVR)) return false;
-				IP += 3; break;
+				if (IP + 5 > BC.size()) return fail(IP, "OP_INTTOPTR truncated");
+				if (!chk(IP, "preg", rdIdx(IP + 1), E.NPR)) return false;
+				if (!chk(IP, "vreg", rdIdx(IP + 3), E.NVR)) return false;
+				IP += 5; break;
 			}
 			case OP_INTTOPTR64: {
-				if (IP + 3 > BC.size()) return fail(IP, "OP_INTTOPTR64 truncated");
-				if (!chk(IP, "preg", decIdx(BC[IP + 1]), E.NPR)) return false;
-				if (!chk(IP, "vreg64", decIdx(BC[IP + 2]), E.NVR64)) return false;
-				IP += 3; break;
+				if (IP + 5 > BC.size()) return fail(IP, "OP_INTTOPTR64 truncated");
+				if (!chk(IP, "preg", rdIdx(IP + 1), E.NPR)) return false;
+				if (!chk(IP, "vreg64", rdIdx(IP + 3), E.NVR64)) return false;
+				IP += 5; break;
 			}
-			case OP_LOAD32: {
-				if (IP + 3 > BC.size()) return fail(IP, "OP_LOAD32 truncated");
-				if (!chk(IP, "vreg", decIdx(BC[IP + 1]), E.NVR)) return false;
-				if (!chk(IP, "preg", decIdx(BC[IP + 2]), E.NPR)) return false;
-				IP += 3; break;
+			case OP_LOAD32: case OP_LOAD8: case OP_LOAD16: {
+				if (IP + 5 > BC.size()) return fail(IP, "OP_LOAD* truncated");
+				if (!chk(IP, "vreg", rdIdx(IP + 1), E.NVR)) return false;
+				if (!chk(IP, "preg", rdIdx(IP + 3), E.NPR)) return false;
+				IP += 5; break;
 			}
 			case OP_LOAD64: {
-				if (IP + 3 > BC.size()) return fail(IP, "OP_LOAD64 truncated");
-				if (!chk(IP, "vreg64", decIdx(BC[IP + 1]), E.NVR64)) return false;
-				if (!chk(IP, "preg", decIdx(BC[IP + 2]), E.NPR)) return false;
-				IP += 3; break;
+				if (IP + 5 > BC.size()) return fail(IP, "OP_LOAD64 truncated");
+				if (!chk(IP, "vreg64", rdIdx(IP + 1), E.NVR64)) return false;
+				if (!chk(IP, "preg", rdIdx(IP + 3), E.NPR)) return false;
+				IP += 5; break;
 			}
-			case OP_LOAD8:
-			case OP_LOAD16: {
-				if (IP + 3 > BC.size()) return fail(IP, "OP_LOAD{8,16} truncated");
-				if (!chk(IP, "vreg", decIdx(BC[IP + 1]), E.NVR)) return false;
-				if (!chk(IP, "preg", decIdx(BC[IP + 2]), E.NPR)) return false;
-				IP += 3; break;
-			}
-
-			case OP_STORE32: {
-				if (IP + 3 > BC.size()) return fail(IP, "OP_STORE32 truncated");
-				if (!chk(IP, "vreg", decIdx(BC[IP + 1]), E.NVR)) return false;
-				if (!chk(IP, "preg", decIdx(BC[IP + 2]), E.NPR)) return false;
-				IP += 3; break;
+			case OP_STORE32: case OP_STORE8: case OP_STORE16: {
+				if (IP + 5 > BC.size()) return fail(IP, "OP_STORE* truncated");
+				if (!chk(IP, "vreg", rdIdx(IP + 1), E.NVR)) return false;
+				if (!chk(IP, "preg", rdIdx(IP + 3), E.NPR)) return false;
+				IP += 5; break;
 			}
 			case OP_STORE64: {
-				if (IP + 3 > BC.size()) return fail(IP, "OP_STORE64 truncated");
-				if (!chk(IP, "vreg64", decIdx(BC[IP + 1]), E.NVR64)) return false;
-				if (!chk(IP, "preg", decIdx(BC[IP + 2]), E.NPR)) return false;
-				IP += 3; break;
+				if (IP + 5 > BC.size()) return fail(IP, "OP_STORE64 truncated");
+				if (!chk(IP, "vreg64", rdIdx(IP + 1), E.NVR64)) return false;
+				if (!chk(IP, "preg", rdIdx(IP + 3), E.NPR)) return false;
+				IP += 5; break;
 			}
-			case OP_STORE8:
-			case OP_STORE16: {
-				if (IP + 3 > BC.size()) return fail(IP, "OP_STORE{8,16} truncated");
-				if (!chk(IP, "vreg", decIdx(BC[IP + 1]), E.NVR)) return false;
-				if (!chk(IP, "preg", decIdx(BC[IP + 2]), E.NPR)) return false;
-				IP += 3; break;
+			case OP_LOADPTR: case OP_STOREPTR: {
+				if (IP + 5 > BC.size()) return fail(IP, "OP_*PTR truncated");
+				if (!chk(IP, "preg", rdIdx(IP + 1), E.NPR)) return false;
+				if (!chk(IP, "preg", rdIdx(IP + 3), E.NPR)) return false;
+				IP += 5; break;
 			}
-			case OP_LOADPTR: {
-				if (IP + 3 > BC.size()) return fail(IP, "OP_LOADPTR truncated");
-				if (!chk(IP, "preg", decIdx(BC[IP + 1]), E.NPR)) return false; // dstp
-				if (!chk(IP, "preg", decIdx(BC[IP + 2]), E.NPR)) return false; // ptrreg
-				IP += 3; break;
-			}
-			case OP_STOREPTR: {
-				if (IP + 3 > BC.size()) return fail(IP, "OP_STOREPTR truncated");
-				if (!chk(IP, "preg", decIdx(BC[IP + 1]), E.NPR)) return false; // valp
-				if (!chk(IP, "preg", decIdx(BC[IP + 2]), E.NPR)) return false; // ptrreg
-				IP += 3; break;
-			}
-
 			case OP_GEP: {
-				if (IP + 6 > BC.size()) return fail(IP, "OP_GEP truncated");
-				if (!chk(IP, "preg", decIdx(BC[IP + 1]), E.NPR)) return false;
-				if (!chk(IP, "preg", decIdx(BC[IP + 2]), E.NPR)) return false;
-				if (!chk(IP, "vreg", decIdx(BC[IP + 3]), E.NVR)) return false;
-				IP += 6; break;
+				if (IP + 9 > BC.size()) return fail(IP, "OP_GEP truncated");
+				if (!chk(IP, "preg", rdIdx(IP + 1), E.NPR)) return false;
+				if (!chk(IP, "preg", rdIdx(IP + 3), E.NPR)) return false;
+				if (!chk(IP, "vreg", rdIdx(IP + 5), E.NVR)) return false;
+				IP += 9; break;
 			}
 			case OP_GEP64: {
-				if (IP + 6 > BC.size()) return fail(IP, "OP_GEP64 truncated");
-				if (!chk(IP, "preg", decIdx(BC[IP + 1]), E.NPR)) return false;
-				if (!chk(IP, "preg", decIdx(BC[IP + 2]), E.NPR)) return false;
-				if (!chk(IP, "vreg64", decIdx(BC[IP + 3]), E.NVR64)) return false;
-				IP += 6; break;
+				if (IP + 9 > BC.size()) return fail(IP, "OP_GEP64 truncated");
+				if (!chk(IP, "preg", rdIdx(IP + 1), E.NPR)) return false;
+				if (!chk(IP, "preg", rdIdx(IP + 3), E.NPR)) return false;
+				if (!chk(IP, "vreg64", rdIdx(IP + 5), E.NVR64)) return false;
+				IP += 9; break;
 			}
 			case OP_JMP: {
 				if (IP + 5 > BC.size()) return fail(IP, "OP_JMP truncated");
-				uint32_t Tgt = rdU32(IP + 1);
-				if (!chkTarget(IP, Tgt, "OP_JMP")) return false;
+				if (!chkTarget(IP, rdU32(IP + 1), "OP_JMP")) return false;
 				IP += 5; break;
 			}
 			case OP_JMPC: {
-				if (IP + 10 > BC.size()) return fail(IP, "OP_JMPC truncated");
-				if (!chk(IP, "vreg", decIdx(BC[IP + 1]), E.NVR)) return false;
-				uint32_t T = rdU32(IP + 2);
-				uint32_t F = rdU32(IP + 6);
-				if (!chkTarget(IP, T, "OP_JMPC.true")) return false;
-				if (!chkTarget(IP, F, "OP_JMPC.false")) return false;
-				IP += 10; break;
+				if (IP + 11 > BC.size()) return fail(IP, "OP_JMPC truncated");
+				if (!chk(IP, "vreg", rdIdx(IP + 1), E.NVR)) return false;
+				if (!chkTarget(IP, rdU32(IP + 3), "OP_JMPC.true")) return false;
+				if (!chkTarget(IP, rdU32(IP + 7), "OP_JMPC.false")) return false;
+				IP += 11; break;
 			}
-			case OP_RET_VOID: {
-				IP += 1; break;
-			}
+			case OP_RET_VOID: { IP += 1; break; }
 			case OP_RET_INT: {
-				if (IP + 2 > BC.size()) return fail(IP, "OP_RET_INT truncated");
-				// OP_RET_INT is emitted for BOTH i32 (vreg slot) and i64
-				// (vreg64 slot) returns — the opcode does not encode which.
-				// Accept a slot valid in EITHER integer register file, else an
-				// i64 return whose vreg64 slot index exceeds NVR false-fails.
+				if (IP + 3 > BC.size()) return fail(IP, "OP_RET_INT truncated");
 				unsigned RetLim = E.NVR > E.NVR64 ? E.NVR : E.NVR64;
-				if (!chk(IP, "vreg/vreg64", decIdx(BC[IP + 1]), RetLim)) return false;
-				IP += 2; break;
+				if (!chk(IP, "vreg/vreg64", rdIdx(IP + 1), RetLim)) return false;
+				IP += 3; break;
 			}
 			case OP_RET_PTR: {
-				if (IP + 2 > BC.size()) return fail(IP, "OP_RET_PTR truncated");
-				if (!chk(IP, "preg", decIdx(BC[IP + 1]), E.NPR)) return false;
-				IP += 2; break;
+				if (IP + 3 > BC.size()) return fail(IP, "OP_RET_PTR truncated");
+				if (!chk(IP, "preg", rdIdx(IP + 1), E.NPR)) return false;
+				IP += 3; break;
 			}
 			case OP_CALL_VOID: {
 				if (!verifyCall(IP, 0)) return false;
@@ -394,11 +355,11 @@ namespace llvm {
 				if (!verifyCall(IP, 2)) return false;
 				IP += callTotal(IP, 1); break;
 			}
-			case OP_CALL_INT64: {  
+			case OP_CALL_INT64: {
 				if (!verifyCall(IP, 3)) return false;
 				IP += callTotal(IP, 1); break;
 			}
-			case OP_CALL_F: {      
+			case OP_CALL_F: {
 				if (!verifyCall(IP, 4)) return false;
 				IP += callTotal(IP, 1); break;
 			}
@@ -407,194 +368,155 @@ namespace llvm {
 				IP += callTotal(IP, 2); break;
 			}
 			case OP_SELECT: {
-				if (IP + 6 > BC.size()) return fail(IP, "OP_SELECT truncated");
+				if (IP + 10 > BC.size()) return fail(IP, "OP_SELECT truncated");
 				uint8_t Kind = BC[IP + 1];
-				if (!chk(IP, "vreg", decIdx(BC[IP + 3]), E.NVR)) return false; 
+				if (!chk(IP, "vreg", rdIdx(IP + 4), E.NVR)) return false; // cond
 				if (Kind == 0) {
-					if (!chk(IP, "vreg", decIdx(BC[IP + 2]), E.NVR)) return false;
-					if (!chk(IP, "vreg", decIdx(BC[IP + 4]), E.NVR)) return false;
-					if (!chk(IP, "vreg", decIdx(BC[IP + 5]), E.NVR)) return false;
-				}
-				else if (Kind == 1) {
-					if (!chk(IP, "preg", decIdx(BC[IP + 2]), E.NPR)) return false;
-					if (!chk(IP, "preg", decIdx(BC[IP + 4]), E.NPR)) return false;
-					if (!chk(IP, "preg", decIdx(BC[IP + 5]), E.NPR)) return false;
-				}
-				else if (Kind == 2) {
-					if (!chk(IP, "vreg64", decIdx(BC[IP + 2]), E.NVR64)) return false;
-					if (!chk(IP, "vreg64", decIdx(BC[IP + 4]), E.NVR64)) return false;
-					if (!chk(IP, "vreg64", decIdx(BC[IP + 5]), E.NVR64)) return false;
-				}
-				else {
+					if (!chk(IP, "vreg", rdIdx(IP + 2), E.NVR)) return false;
+					if (!chk(IP, "vreg", rdIdx(IP + 6), E.NVR)) return false;
+					if (!chk(IP, "vreg", rdIdx(IP + 8), E.NVR)) return false;
+				} else if (Kind == 1) {
+					if (!chk(IP, "preg", rdIdx(IP + 2), E.NPR)) return false;
+					if (!chk(IP, "preg", rdIdx(IP + 6), E.NPR)) return false;
+					if (!chk(IP, "preg", rdIdx(IP + 8), E.NPR)) return false;
+				} else if (Kind == 2) {
+					if (!chk(IP, "vreg64", rdIdx(IP + 2), E.NVR64)) return false;
+					if (!chk(IP, "vreg64", rdIdx(IP + 6), E.NVR64)) return false;
+					if (!chk(IP, "vreg64", rdIdx(IP + 8), E.NVR64)) return false;
+				} else {
 					return fail(IP, Twine("OP_SELECT invalid kind ") + Twine((unsigned)Kind));
 				}
-				IP += 6; break;
+				IP += 10; break;
 			}
 			case OP_BINOP64: {
-				if (IP + 5 > BC.size()) return fail(IP, "OP_BINOP64 truncated");
-				if (!chk(IP, "vreg64", decIdx(BC[IP + 1]), E.NVR64)) return false;
-				if (!chk(IP, "vreg64", decIdx(BC[IP + 2]), E.NVR64)) return false;
-				if (!chk(IP, "vreg64", decIdx(BC[IP + 3]), E.NVR64)) return false;
-				IP += 5; break;
+				if (IP + 8 > BC.size()) return fail(IP, "OP_BINOP64 truncated");
+				if (!chk(IP, "vreg64", rdIdx(IP + 1), E.NVR64)) return false;
+				if (!chk(IP, "vreg64", rdIdx(IP + 3), E.NVR64)) return false;
+				if (!chk(IP, "vreg64", rdIdx(IP + 5), E.NVR64)) return false;
+				IP += 8; break;
 			}
 			case OP_SWITCH: {
-				if (IP + 8 > BC.size()) return fail(IP, "OP_SWITCH header truncated");
-				if (!chk(IP, "vreg", decIdx(BC[IP + 1]), E.NVR)) return false;
-				uint16_t NC = rdU16(IP + 2);
-				uint32_t Def = rdU32(IP + 4);
-				uint32_t Sz = 8u + (uint32_t)NC * 8u;
+				if (IP + 9 > BC.size()) return fail(IP, "OP_SWITCH header truncated");
+				if (!chk(IP, "vreg", rdIdx(IP + 1), E.NVR)) return false;
+				uint16_t NC = rdU16(IP + 3);
+				uint32_t Def = rdU32(IP + 5);
+				uint32_t Sz = 9u + (uint32_t)NC * 8u;
 				if (IP + Sz > BC.size()) return fail(IP, "OP_SWITCH cases truncated");
 				if (!chkTarget(IP, Def, "OP_SWITCH.default")) return false;
-				uint32_t COff = IP + 8;
+				uint32_t COff = IP + 9;
 				for (unsigned i = 0; i < NC; ++i) {
 					(void)rdU32(COff + 0);
-					uint32_t Tgt = rdU32(COff + 4);
-					if (!chkTarget(IP, Tgt, "OP_SWITCH.case")) return false;
+					if (!chkTarget(IP, rdU32(COff + 4), "OP_SWITCH.case")) return false;
 					COff += 8;
 				}
 				IP += Sz; break;
 			}
-
-
-		
-
-			// ── float register file opcodes ────────────────────────────
-			case OP_LOADI_F: {  // dst:u8 imm:f64le (10 bytes)
-				if (IP + 10 > BC.size()) return fail(IP, "OP_LOADI_F truncated");
-				if (!chk(IP, "freg", decIdx(BC[IP + 1]), E.NFR)) return false;
-				IP += 10; break;
+			case OP_LOADI_F: {
+				if (IP + 11 > BC.size()) return fail(IP, "OP_LOADI_F truncated");
+				if (!chk(IP, "freg", rdIdx(IP + 1), E.NFR)) return false;
+				IP += 11; break;
 			}
-			case OP_MOVR_F: {   // dst:u8 src:u8 (3 bytes)
-				if (IP + 3 > BC.size()) return fail(IP, "OP_MOVR_F truncated");
-				if (!chk(IP, "freg", decIdx(BC[IP + 1]), E.NFR)) return false;
-				if (!chk(IP, "freg", decIdx(BC[IP + 2]), E.NFR)) return false;
-				IP += 3; break;
+			case OP_MOVR_F: {
+				if (IP + 5 > BC.size()) return fail(IP, "OP_MOVR_F truncated");
+				if (!chk(IP, "freg", rdIdx(IP + 1), E.NFR)) return false;
+				if (!chk(IP, "freg", rdIdx(IP + 3), E.NFR)) return false;
+				IP += 5; break;
 			}
-			case OP_BINOP_F: {  // dst:u8 a:u8 b:u8 subop:u8 (5 bytes)
-				// subop byte layout: bits[6:0] = FBinSubop, bit[7] = FBS_F32_FLAG.
-				// Mask bit 7 before range-checking the operation.
-				if (IP + 5 > BC.size()) return fail(IP, "OP_BINOP_F truncated");
-				if (!chk(IP, "freg", decIdx(BC[IP + 1]), E.NFR)) return false;
-				if (!chk(IP, "freg", decIdx(BC[IP + 2]), E.NFR)) return false;
-				if (!chk(IP, "freg", decIdx(BC[IP + 3]), E.NFR)) return false;
+			case OP_BINOP_F: {
+				if (IP + 8 > BC.size()) return fail(IP, "OP_BINOP_F truncated");
+				if (!chk(IP, "freg", rdIdx(IP + 1), E.NFR)) return false;
+				if (!chk(IP, "freg", rdIdx(IP + 3), E.NFR)) return false;
+				if (!chk(IP, "freg", rdIdx(IP + 5), E.NFR)) return false;
 				{
-					uint8_t Sub = BC[IP + 4] & ~(uint8_t)FBS_F32_FLAG;
+					uint8_t Sub = BC[IP + 7] & ~(uint8_t)FBS_F32_FLAG;
 					if (Sub > (uint8_t)FBS_FREM)
 						return fail(IP, Twine("OP_BINOP_F invalid subop: ") + Twine((unsigned)Sub));
 				}
+				IP += 8; break;
+			}
+			case OP_FCMP: {
+				if (IP + 8 > BC.size()) return fail(IP, "OP_FCMP truncated");
+				if (!chk(IP, "vreg", rdIdx(IP + 1), E.NVR)) return false;
+				if (!chk(IP, "freg", rdIdx(IP + 3), E.NFR)) return false;
+				if (!chk(IP, "freg", rdIdx(IP + 5), E.NFR)) return false;
+				IP += 8; break;
+			}
+			case OP_FCAST_FF: {
+				if (IP + 6 > BC.size()) return fail(IP, "OP_FCAST_FF truncated");
+				if (!chk(IP, "freg", rdIdx(IP + 1), E.NFR)) return false;
+				if (!chk(IP, "freg", rdIdx(IP + 3), E.NFR)) return false;
+				{ unsigned K = BC[IP + 5];
+				  if (K != FK_FPEXT && K != FK_FPTRUNC)
+					return fail(IP, Twine("OP_FCAST_FF invalid kind ") + Twine(K)); }
+				IP += 6; break;
+			}
+			case OP_FCAST_FV: {
+				if (IP + 6 > BC.size()) return fail(IP, "OP_FCAST_FV truncated");
+				if (!chk(IP, "vreg", rdIdx(IP + 1), E.NVR)) return false;
+				if (!chk(IP, "freg", rdIdx(IP + 3), E.NFR)) return false;
+				{ unsigned K = BC[IP + 5];
+				  if (K != FK_FPTOSI && K != FK_FPTOUI)
+					return fail(IP, Twine("OP_FCAST_FV invalid kind ") + Twine(K)); }
+				IP += 6; break;
+			}
+			case OP_FCAST_FV64: {
+				if (IP + 6 > BC.size()) return fail(IP, "OP_FCAST_FV64 truncated");
+				if (!chk(IP, "vreg64", rdIdx(IP + 1), E.NVR64)) return false;
+				if (!chk(IP, "freg", rdIdx(IP + 3), E.NFR)) return false;
+				{ unsigned K = BC[IP + 5];
+				  if (K != FK_FPTOSI64 && K != FK_FPTOUI64)
+					return fail(IP, Twine("OP_FCAST_FV64 invalid kind ") + Twine(K)); }
+				IP += 6; break;
+			}
+			case OP_FCAST_VF: {
+				if (IP + 6 > BC.size()) return fail(IP, "OP_FCAST_VF truncated");
+				if (!chk(IP, "freg", rdIdx(IP + 1), E.NFR)) return false;
+				if (!chk(IP, "vreg", rdIdx(IP + 3), E.NVR)) return false;
+				{ unsigned K = BC[IP + 5] & 0x7Fu;
+				  if (K != FK_SITOFP && K != FK_UITOFP)
+					return fail(IP, Twine("OP_FCAST_VF invalid kind ") + Twine(K)); }
+				IP += 6; break;
+			}
+			case OP_FCAST_V64F: {
+				if (IP + 6 > BC.size()) return fail(IP, "OP_FCAST_V64F truncated");
+				if (!chk(IP, "freg", rdIdx(IP + 1), E.NFR)) return false;
+				if (!chk(IP, "vreg64", rdIdx(IP + 3), E.NVR64)) return false;
+				{ unsigned K = BC[IP + 5] & 0x7Fu;
+				  if (K != FK_SI64TOFP && K != FK_UI64TOFP)
+					return fail(IP, Twine("OP_FCAST_V64F invalid kind ") + Twine(K)); }
+				IP += 6; break;
+			}
+			case OP_LOAD_F: case OP_LOAD_F32: {
+				if (IP + 5 > BC.size()) return fail(IP, "OP_LOAD_F* truncated");
+				if (!chk(IP, "freg", rdIdx(IP + 1), E.NFR)) return false;
+				if (!chk(IP, "preg", rdIdx(IP + 3), E.NPR)) return false;
 				IP += 5; break;
 			}
-			case OP_FCMP: {     // dst_vr:u8 a_fr:u8 b_fr:u8 pred:u8 (5 bytes) → result in vreg
-				if (IP + 5 > BC.size()) return fail(IP, "OP_FCMP truncated");
-				if (!chk(IP, "vreg", decIdx(BC[IP + 1]), E.NVR))  return false;  // dst in vreg
-				if (!chk(IP, "freg", decIdx(BC[IP + 2]), E.NFR))  return false;
-				if (!chk(IP, "freg", decIdx(BC[IP + 3]), E.NFR))  return false;
+			case OP_STORE_F: case OP_STORE_F32: {
+				if (IP + 5 > BC.size()) return fail(IP, "OP_STORE_F* truncated");
+				if (!chk(IP, "freg", rdIdx(IP + 1), E.NFR)) return false;
+				if (!chk(IP, "preg", rdIdx(IP + 3), E.NPR)) return false;
 				IP += 5; break;
 			}
-			
-			case OP_FCAST_FF: {   // dst_fr:u8 src_fr:u8 kind:u8 (4 bytes) — freg→freg
-				if (IP + 4 > BC.size()) return fail(IP, "OP_FCAST_FF truncated");
-				if (!chk(IP, "freg", decIdx(BC[IP + 1]), E.NFR)) return false;
-				if (!chk(IP, "freg", decIdx(BC[IP + 2]), E.NFR)) return false;
-				{
-					unsigned K = BC[IP + 3];
-					if (K != FK_FPEXT && K != FK_FPTRUNC)
-						return fail(IP, Twine("OP_FCAST_FF invalid kind ") + Twine(K));
-				}
-				IP += 4; break;
-			}
-			case OP_FCAST_FV: {   // dst_vr:u8 src_fr:u8 kind:u8 (4 bytes) — freg→vreg i32
-				if (IP + 4 > BC.size()) return fail(IP, "OP_FCAST_FV truncated");
-				if (!chk(IP, "vreg", decIdx(BC[IP + 1]), E.NVR))  return false;
-				if (!chk(IP, "freg", decIdx(BC[IP + 2]), E.NFR))  return false;
-				{
-					unsigned K = BC[IP + 3];
-					if (K != FK_FPTOSI && K != FK_FPTOUI)
-						return fail(IP, Twine("OP_FCAST_FV invalid kind ") + Twine(K));
-				}
-				IP += 4; break;
-			}
-			case OP_FCAST_FV64: { // dst_vr64:u8 src_fr:u8 kind:u8 (4 bytes) — freg→vreg64 i64
-				if (IP + 4 > BC.size()) return fail(IP, "OP_FCAST_FV64 truncated");
-				if (!chk(IP, "vreg64", decIdx(BC[IP + 1]), E.NVR64)) return false;
-				if (!chk(IP, "freg", decIdx(BC[IP + 2]), E.NFR))   return false;
-				{
-					unsigned K = BC[IP + 3];
-					if (K != FK_FPTOSI64 && K != FK_FPTOUI64)
-						return fail(IP, Twine("OP_FCAST_FV64 invalid kind ") + Twine(K));
-				}
-				IP += 4; break;
-			}
-			case OP_FCAST_VF: {   // dst_fr:u8 src_vr:u8 kind:u8 (4 bytes) — vreg i32→freg
-				if (IP + 4 > BC.size()) return fail(IP, "OP_FCAST_VF truncated");
-				if (!chk(IP, "freg", decIdx(BC[IP + 1]), E.NFR)) return false;
-				if (!chk(IP, "vreg", decIdx(BC[IP + 2]), E.NVR)) return false;
-				{
-					unsigned K = BC[IP + 3] & 0x7Fu;  // mask FCAST_F32_FLAG
-					if (K != FK_SITOFP && K != FK_UITOFP)
-						return fail(IP, Twine("OP_FCAST_VF invalid kind ") + Twine(K));
-				}
-				IP += 4; break;
-			}
-			case OP_FCAST_V64F: { // dst_fr:u8 src_vr64:u8 kind:u8 (4 bytes) — vreg64 i64→freg
-				if (IP + 4 > BC.size()) return fail(IP, "OP_FCAST_V64F truncated");
-				if (!chk(IP, "freg", decIdx(BC[IP + 1]), E.NFR))   return false;
-				if (!chk(IP, "vreg64", decIdx(BC[IP + 2]), E.NVR64)) return false;
-				{
-					unsigned K = BC[IP + 3] & 0x7Fu;  // mask FCAST_F32_FLAG
-					if (K != FK_SI64TOFP && K != FK_UI64TOFP)
-						return fail(IP, Twine("OP_FCAST_V64F invalid kind ") + Twine(K));
-				}
-				IP += 4; break;
-			}
-
-
-
-
-			case OP_LOAD_F: {   // dst_fr:u8 ptrreg:u8 (3 bytes)
-				if (IP + 3 > BC.size()) return fail(IP, "OP_LOAD_F truncated");
-				if (!chk(IP, "freg", decIdx(BC[IP + 1]), E.NFR)) return false;
-				if (!chk(IP, "preg", decIdx(BC[IP + 2]), E.NPR)) return false;
+			case OP_RET_F: {
+				if (IP + 3 > BC.size()) return fail(IP, "OP_RET_F truncated");
+				if (!chk(IP, "freg", rdIdx(IP + 1), E.NFR)) return false;
 				IP += 3; break;
 			}
-			case OP_STORE_F: {  // val_fr:u8 ptrreg:u8 (3 bytes)
-				if (IP + 3 > BC.size()) return fail(IP, "OP_STORE_F truncated");
-				if (!chk(IP, "freg", decIdx(BC[IP + 1]), E.NFR)) return false;
-				if (!chk(IP, "preg", decIdx(BC[IP + 2]), E.NPR)) return false;
-				IP += 3; break;
+			case OP_SELECT_F: {
+				if (IP + 9 > BC.size()) return fail(IP, "OP_SELECT_F truncated");
+				if (!chk(IP, "freg", rdIdx(IP + 1), E.NFR)) return false;
+				if (!chk(IP, "vreg", rdIdx(IP + 3), E.NVR)) return false;
+				if (!chk(IP, "freg", rdIdx(IP + 5), E.NFR)) return false;
+				if (!chk(IP, "freg", rdIdx(IP + 7), E.NFR)) return false;
+				IP += 9; break;
 			}
-			case OP_LOAD_F32: {  // dst_fr:u8 ptrreg:u8 (3 bytes) — 4-byte float load
-				if (IP + 3 > BC.size()) return fail(IP, "OP_LOAD_F32 truncated");
-				if (!chk(IP, "freg", decIdx(BC[IP + 1]), E.NFR)) return false;
-				if (!chk(IP, "preg", decIdx(BC[IP + 2]), E.NPR)) return false;
-				IP += 3; break;
-			}
-			case OP_STORE_F32: {  // val_fr:u8 ptrreg:u8 (3 bytes) — 4-byte float store
-				if (IP + 3 > BC.size()) return fail(IP, "OP_STORE_F32 truncated");
-				if (!chk(IP, "freg", decIdx(BC[IP + 1]), E.NFR)) return false;
-				if (!chk(IP, "preg", decIdx(BC[IP + 2]), E.NPR)) return false;
-				IP += 3; break;
-			}
-			case OP_RET_F: {    // src_fr:u8 (2 bytes)
-				if (IP + 2 > BC.size()) return fail(IP, "OP_RET_F truncated");
-				if (!chk(IP, "freg", decIdx(BC[IP + 1]), E.NFR)) return false;
-				IP += 2; break;
-			}
-			case OP_SELECT_F: { // dst_fr:u8 cond_vr:u8 t_fr:u8 f_fr:u8 (5 bytes)
-				if (IP + 5 > BC.size()) return fail(IP, "OP_SELECT_F truncated");
-				if (!chk(IP, "freg", decIdx(BC[IP + 1]), E.NFR)) return false;  // dst
-				if (!chk(IP, "vreg", decIdx(BC[IP + 2]), E.NVR)) return false;  // cond
-				if (!chk(IP, "freg", decIdx(BC[IP + 3]), E.NFR)) return false;  // t
-				if (!chk(IP, "freg", decIdx(BC[IP + 4]), E.NFR)) return false;  // f
+			case OP_FNEG: {
+				if (IP + 5 > BC.size()) return fail(IP, "OP_FNEG truncated");
+				if (!chk(IP, "freg", rdIdx(IP + 1), E.NFR)) return false;
+				if (!chk(IP, "freg", rdIdx(IP + 3), E.NFR)) return false;
 				IP += 5; break;
 			}
-			case OP_FNEG: {  // dst_fr:u8 src_fr:u8 (3 bytes)
-				if (IP + 3 > BC.size()) return fail(IP, "OP_FNEG truncated");
-				if (!chk(IP, "freg", decIdx(BC[IP + 1]), E.NFR)) return false;  // dst
-				if (!chk(IP, "freg", decIdx(BC[IP + 2]), E.NFR)) return false;  // src
-				IP += 3; break;
-			}
-
 			default: {
 				return fail(IP, Twine("unhandled opcode in verifier: phys=") + Twine((unsigned)Phys) + " logical=" + Twine((unsigned)Opc));
 			}

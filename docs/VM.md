@@ -151,14 +151,14 @@ The VM maintains four separate typed register files:
 
 | File | LLVM alloca type | Purpose | Max slots |
 |---|---|---|---|
-| `vm.regs` | `[N × i32]` | 32-bit integer values | 255 (soft fail at 250) |
-| `vm.regs64` | `[N × i64]` | 64-bit integer values | 255 (soft fail at 250) |
-| `vm.fregs` | `[N × double]` | Floating-point values (all stored as f64) | 255 (soft fail at 250) |
-| `vm.pregs` | `[N × ptr]` | Pointer values | 255 (soft fail at 250) |
+| `vm.regs` | `[N × i32]` | 32-bit integer values | 4096 (u16le ISA; soft fail at kMaxSlots) |
+| `vm.regs64` | `[N × i64]` | 64-bit integer values | 4096 |
+| `vm.fregs` | `[N × double]` | Floating-point values (all stored as f64) | 4096 |
+| `vm.pregs` | `[N × ptr]` | Pointer values | 4096 |
 
-The ceiling is the ISA index width (`u8` per slot index), not a tunable knob.
+The ceiling is the ISA index width (`u16le` per slot index; soft cap 4096), not a free knob.
 `N` is the **high-water mark of simultaneously live values** after liveness reuse, not
-the instruction count. Soft fail at 250 leaves headroom under `0xFF` /
+the instruction count. Soft fail at `kMaxSlots` (4096) leaves headroom under `0xFFFF` sentinel.
 `kInvalidSlot`. f32 values are widened to f64 on slot assignment and narrowed back
 when stored to memory or returned.
 
@@ -234,7 +234,7 @@ Before slot assignment, `VMImpl::run()` rewrites IR the emitter cannot encode:
     `load`/`store` (`store` via `memcpy` of `(W+7)/8` bytes). >64 arith stays
     bitfield-only (`__vm_il_*`); not promoted into the i64 file.
   **MBA** must not rewrite BO of non-{8,16,32,64} width. When VM is co-enabled, MBA
-  `maxSites` is throttled on large functions so live SSA stays under the u8 slot cap (≤254).
+  `maxSites` is throttled on large functions so live SSA stays under the u16 slot soft cap (4096).
 - **Aggregate load:** 2-field structs of ptr / i64 / int≤32 with extractvalue- or aggregate-store
   users → scalar loads at DL offsets (`commonAlignment` for field1).
 - **Odd pair calls:** 2-field returns that are not `{ptr,i64}` → `internal` sret wrapper
@@ -268,8 +268,8 @@ gets a `preg` slot pointing to the alloca.
 6. `{ptr,i64}` pair slots and their `extractvalue` aliases are pinned (shared indices).
 
 `NVR` / `NVR64` / `NPR` / `NFR` store the high-water mark (max live). Overflow means
-max-live exceeded 250, not that the function had too many instructions. Indices stay
-`u8` in the bytecode ISA — raising the limit past 255 requires an ISA-wide widen.
+max-live exceeded the soft cap, not that the function had too many instructions. Indices are
+`u16le` in the bytecode ISA (soft cap 4096).
 
 ### Bytecode emission — Pass 2
 
@@ -325,30 +325,30 @@ passed through a per-function permutation (see [Opcode permutation](#opcode-perm
 
 | Logical opcode | Value | Encoding (bytes) | Description |
 |---|---|---|---|
-| `OP_LOADI` | 0x00 | `opc dst:u8 imm:i32le` (6 B) | Load 32-bit immediate into vreg. |
-| `OP_MOVR` | 0x01 | `opc dst:u8 src:u8` (3 B) | Copy vreg to vreg. |
-| `OP_BINOP` | 0x02 | `opc dst:u8 a:u8 b:u8 subop:u8` (5 B) | Binary integer op on vregs (all integer `BW≤32`, incl. i1/i8/i16). See BinSubop table. |
-| `OP_ICMP` | 0x03 | `opc dst:u8 a:u8 b:u8 pred:u8` (5 B) | Integer compare on i32-file values (all integer `BW≤32`, incl. i1/i8/i16); result (0/1) into vreg. |
-| `OP_ICMP_PTR` | 0x38 | `opc dst:u8 a:u8 b:u8 pred:u8` (5 B) | Pointer compare (`eq`/`ne`); preg×preg → vreg 0/1. |
-| `OP_CAST` | 0x04 | `opc dst:u8 src:u8 kind:u8` (4 B) | Integer widening/narrowing within the i32 file (incl. `zext i1→i8`). See CastKind table. |
-| `OP_PTRTOINT` | 0x05 | `opc dst:u8 srcp:u8` (3 B) | `ptrtoint` preg → vreg (i32). |
-| `OP_INTTOPTR` | 0x06 | `opc dstp:u8 src:u8` (3 B) | `inttoptr` vreg (i32) → preg. |
-| `OP_INTTOPTR64` | 0x3A | `opc dstp:u8 src64:u8` (3 B) | `inttoptr` vreg64 (i64) → preg (inverse of `OP_PTRTOINT64`). |
-| `OP_LOAD32` | 0x07 | `opc dst:u8 ptrreg:u8` (3 B) | Load i32 from address in preg. |
-| `OP_STORE32` | 0x08 | `opc val:u8 ptrreg:u8` (3 B) | Store i32 to address in preg. |
-| `OP_GEP` | 0x09 | `opc dstp:u8 basep:u8 idx:u8 elemsz:u16le` (6 B) | GEP: `basep + idx * elemsz` → preg. Fully-constant multi-index GEPs use byte offset with `elemsz=1` when the offset fits i32. |
-| `OP_LOAD8` | 0x1B | `opc dst:u8 ptrreg:u8` (3 B) | Load i8 (zero-extend to i32). `load i1` is this plus `CK_TRUNC1` on the same slot. |
-| `OP_STORE8` | 0x1C | `opc val:u8 ptrreg:u8` (3 B) | Truncate vreg to i8, store. Also used for `store i1` (1-byte). |
-| `OP_LOAD16` | 0x1D | `opc dst:u8 ptrreg:u8` (3 B) | Load i16 (zero-extend to i32). |
-| `OP_STORE16` | 0x1E | `opc val:u8 ptrreg:u8` (3 B) | Truncate vreg to i16, store. |
-| `OP_LOADPTR` | 0x1F | `opc dstp:u8 ptrreg:u8` (3 B) | Load pointer from address in preg. |
-| `OP_STOREPTR` | 0x20 | `opc valp:u8 ptrreg:u8` (3 B) | Store pointer to address in preg. |
-| `OP_SELECT` | 0x12 | `opc kind:u8 dst:u8 cond:u8 t:u8 f:u8` (6 B) | Ternary select across register files. |
-| `OP_PTRTOINT64` | 0x13 | `opc dst64:u8 srcp:u8` (3 B) | `ptrtoint` preg → vreg64 (i64). |
-| `OP_MULADD` | 0x34 | `opc dst:u8 a:u8 b:u8 c:u8` (5 B) | Fused `dst = a*b + c` (i32). Emitted by `superOps` in place of a `mul`+`add` pair. |
-| `OP_SHLADD` | 0x35 | `opc dst:u8 a:u8 b:u8 c:u8` (5 B) | Fused `dst = (a<<b) + c` (i32). Emitted by `superOps` in place of a `shl`+`add` pair. |
-| `OP_CMPSEL` | 0x36 | `opc dst:u8 a:u8 b:u8 pred:u8 t:u8 f:u8` (7 B) | Fused `dst = (a <pred> b) ? t : f` (i32). Emitted by `superOps` in place of an `icmp`+`select` pair. |
-| `OP_ANDCMPZ` | 0x37 | `opc dst:u8 a:u8 b:u8 pred:u8` (5 B) | Fused `dst = ((a & b) <pred> 0)` as i32 0/1 (`pred` = `eq`/`ne`). Emitted by `superOps` in place of an `and`+`icmp` bit-test. |
+| `OP_LOADI` | 0x00 | `opc dst:u16le imm:i32le` (6 B) | Load 32-bit immediate into vreg. |
+| `OP_MOVR` | 0x01 | `opc dst:u16le src:u16le` (3 B) | Copy vreg to vreg. |
+| `OP_BINOP` | 0x02 | `opc dst:u16le a:u16le b:u16le subop:u8` (5 B) | Binary integer op on vregs (all integer `BW≤32`, incl. i1/i8/i16). See BinSubop table. |
+| `OP_ICMP` | 0x03 | `opc dst:u16le a:u16le b:u16le pred:u8` (5 B) | Integer compare on i32-file values (all integer `BW≤32`, incl. i1/i8/i16); result (0/1) into vreg. |
+| `OP_ICMP_PTR` | 0x38 | `opc dst:u16le a:u16le b:u16le pred:u8` (5 B) | Pointer compare (`eq`/`ne`); preg×preg → vreg 0/1. |
+| `OP_CAST` | 0x04 | `opc dst:u16le src:u16le kind:u8` (4 B) | Integer widening/narrowing within the i32 file (incl. `zext i1→i8`). See CastKind table. |
+| `OP_PTRTOINT` | 0x05 | `opc dst:u16le srcp:u16le` (3 B) | `ptrtoint` preg → vreg (i32). |
+| `OP_INTTOPTR` | 0x06 | `opc dstp:u16le src:u16le` (3 B) | `inttoptr` vreg (i32) → preg. |
+| `OP_INTTOPTR64` | 0x3A | `opc dstp:u16le src64:u16le` (3 B) | `inttoptr` vreg64 (i64) → preg (inverse of `OP_PTRTOINT64`). |
+| `OP_LOAD32` | 0x07 | `opc dst:u16le ptrreg:u16le` (3 B) | Load i32 from address in preg. |
+| `OP_STORE32` | 0x08 | `opc val:u16le ptrreg:u16le` (3 B) | Store i32 to address in preg. |
+| `OP_GEP` | 0x09 | `opc dstp:u16le basep:u16le idx:u16le elemsz:u16le` (6 B) | GEP: `basep + idx * elemsz` → preg. Fully-constant multi-index GEPs use byte offset with `elemsz=1` when the offset fits i32. |
+| `OP_LOAD8` | 0x1B | `opc dst:u16le ptrreg:u16le` (3 B) | Load i8 (zero-extend to i32). `load i1` is this plus `CK_TRUNC1` on the same slot. |
+| `OP_STORE8` | 0x1C | `opc val:u16le ptrreg:u16le` (3 B) | Truncate vreg to i8, store. Also used for `store i1` (1-byte). |
+| `OP_LOAD16` | 0x1D | `opc dst:u16le ptrreg:u16le` (3 B) | Load i16 (zero-extend to i32). |
+| `OP_STORE16` | 0x1E | `opc val:u16le ptrreg:u16le` (3 B) | Truncate vreg to i16, store. |
+| `OP_LOADPTR` | 0x1F | `opc dstp:u16le ptrreg:u16le` (3 B) | Load pointer from address in preg. |
+| `OP_STOREPTR` | 0x20 | `opc valp:u16le ptrreg:u16le` (3 B) | Store pointer to address in preg. |
+| `OP_SELECT` | 0x12 | `opc kind:u8 dst:u16le cond:u16le t:u16le f:u16le` (6 B) | Ternary select across register files. |
+| `OP_PTRTOINT64` | 0x13 | `opc dst64:u16le srcp:u16le` (3 B) | `ptrtoint` preg → vreg64 (i64). |
+| `OP_MULADD` | 0x34 | `opc dst:u16le a:u16le b:u16le c:u16le` (5 B) | Fused `dst = a*b + c` (i32). Emitted by `superOps` in place of a `mul`+`add` pair. |
+| `OP_SHLADD` | 0x35 | `opc dst:u16le a:u16le b:u16le c:u16le` (5 B) | Fused `dst = (a<<b) + c` (i32). Emitted by `superOps` in place of a `shl`+`add` pair. |
+| `OP_CMPSEL` | 0x36 | `opc dst:u16le a:u16le b:u16le pred:u8 t:u16le f:u16le` (7 B) | Fused `dst = (a <pred> b) ? t : f` (i32). Emitted by `superOps` in place of an `icmp`+`select` pair. |
+| `OP_ANDCMPZ` | 0x37 | `opc dst:u16le a:u16le b:u16le pred:u8` (5 B) | Fused `dst = ((a & b) <pred> 0)` as i32 0/1 (`pred` = `eq`/`ne`). Emitted by `superOps` in place of an `and`+`icmp` bit-test. |
 
 </details>
 
@@ -357,13 +357,13 @@ passed through a per-function permutation (see [Opcode permutation](#opcode-perm
 
 | Logical opcode | Value | Encoding | Description |
 |---|---|---|---|
-| `OP_LOAD64` | 0x14 | `opc dst64:u8 ptrreg:u8` (3 B) | Load i64 from address in preg. |
-| `OP_STORE64` | 0x15 | `opc val64:u8 ptrreg:u8` (3 B) | Store i64 to address in preg. |
-| `OP_CAST64` | 0x16 | `opc dst:u8 src:u8 kind:u8` (4 B) | Cross-file cast between i32 and i64. See Cast64Kind table. |
-| `OP_BINOP64` | 0x17 | `opc dst64:u8 a64:u8 b64:u8 subop:u8` (5 B) | Binary op on vreg64 file. Same BinSubop encoding. |
-| `OP_ICMP64` | 0x1A | `opc dst:u8 a64:u8 b64:u8 pred:u8` (5 B) | 64-bit integer compare; result → vreg (i32). |
-| `OP_GEP64` | 0x19 | `opc dstp:u8 basep:u8 idx64:u8 elemsz:u16le` (6 B) | GEP with 64-bit index (variable i64 idx, or signed const byte offset outside i32 but in i64, `elemsz=1`). |
-| `OP_LOADI64` | 0x33 | `opc dst64:u8 imm:i64le` (10 B) | Load 64-bit immediate into vreg64. Emitted by `constInStream` to carry i64 constants inside the encrypted bytecode prologue instead of a plaintext wrapper store. |
+| `OP_LOAD64` | 0x14 | `opc dst64:u16le ptrreg:u16le` (3 B) | Load i64 from address in preg. |
+| `OP_STORE64` | 0x15 | `opc val64:u16le ptrreg:u16le` (3 B) | Store i64 to address in preg. |
+| `OP_CAST64` | 0x16 | `opc dst:u16le src:u16le kind:u8` (4 B) | Cross-file cast between i32 and i64. See Cast64Kind table. |
+| `OP_BINOP64` | 0x17 | `opc dst64:u16le a64:u16le b64:u16le subop:u8` (5 B) | Binary op on vreg64 file. Same BinSubop encoding. |
+| `OP_ICMP64` | 0x1A | `opc dst:u16le a64:u16le b64:u16le pred:u8` (5 B) | 64-bit integer compare; result → vreg (i32). |
+| `OP_GEP64` | 0x19 | `opc dstp:u16le basep:u16le idx64:u16le elemsz:u16le` (6 B) | GEP with 64-bit index (variable i64 idx, or signed const byte offset outside i32 but in i64, `elemsz=1`). |
+| `OP_LOADI64` | 0x33 | `opc dst64:u16le imm:i64le` (10 B) | Load 64-bit immediate into vreg64. Emitted by `constInStream` to carry i64 constants inside the encrypted bytecode prologue instead of a plaintext wrapper store. |
 
 </details>
 
@@ -375,22 +375,22 @@ assignment; f32 destinations are narrowed on store or return.
 
 | Logical opcode | Value | Encoding | Description |
 |---|---|---|---|
-| `OP_LOADI_F` | 0x21 | `opc dst:u8 imm:f64le` (10 B) | Load f64 immediate into freg. |
-| `OP_MOVR_F` | 0x22 | `opc dst:u8 src:u8` (3 B) | Copy freg to freg. |
-| `OP_BINOP_F` | 0x23 | `opc dst:u8 a:u8 b:u8 subop:u8` (5 B) | Binary float op. See FBinSubop table. |
-| `OP_FCMP` | 0x24 | `opc dst:u8 a:u8 b:u8 pred:u8` (5 B) | Float compare (LLVM predicate byte); result → vreg (i32). |
-| `OP_FCAST_FF` | 0x25 | `opc dst_fr:u8 src_fr:u8 kind:u8` (4 B) | fpext / fptrunc within freg file. |
-| `OP_LOAD_F` | 0x26 | `opc dst:u8 ptrreg:u8` (3 B) | Load f64 (8-byte double) from memory into freg. |
-| `OP_STORE_F` | 0x27 | `opc val:u8 ptrreg:u8` (3 B) | Store f64 from freg to memory. |
-| `OP_LOAD_F32` | 0x2D | `opc dst:u8 ptrreg:u8` (3 B) | Load 4-byte float, fpext → freg. |
-| `OP_STORE_F32` | 0x2E | `opc val:u8 ptrreg:u8` (3 B) | fptrunc freg → store 4-byte float. |
-| `OP_RET_F` | 0x28 | `opc src:u8` (2 B) | Return f64 from freg. |
-| `OP_SELECT_F` | 0x29 | `opc dst:u8 cond:u8 t:u8 f:u8` (5 B) | Ternary select on freg. |
-| `OP_FNEG` | 0x2C | `opc dst_fr:u8 src_fr:u8` (3 B) | Negate freg value. |
-| `OP_FCAST_FV` | 0x2F | `opc dst:u8 src:u8 kind:u8` (4 B) | freg (f64) → vreg (i32): fptosi / fptoui. |
-| `OP_FCAST_FV64` | 0x30 | `opc dst64:u8 src:u8 kind:u8` (4 B) | freg (f64) → vreg64 (i64): fptosi / fptoui. |
-| `OP_FCAST_VF` | 0x31 | `opc dst:u8 src:u8 kind:u8` (4 B) | vreg (i32) → freg (f64): sitofp / uitofp. |
-| `OP_FCAST_V64F` | 0x32 | `opc dst:u8 src64:u8 kind:u8` (4 B) | vreg64 (i64) → freg (f64): sitofp / uitofp. |
+| `OP_LOADI_F` | 0x21 | `opc dst:u16le imm:f64le` (10 B) | Load f64 immediate into freg. |
+| `OP_MOVR_F` | 0x22 | `opc dst:u16le src:u16le` (3 B) | Copy freg to freg. |
+| `OP_BINOP_F` | 0x23 | `opc dst:u16le a:u16le b:u16le subop:u8` (5 B) | Binary float op. See FBinSubop table. |
+| `OP_FCMP` | 0x24 | `opc dst:u16le a:u16le b:u16le pred:u8` (5 B) | Float compare (LLVM predicate byte); result → vreg (i32). |
+| `OP_FCAST_FF` | 0x25 | `opc dst_fr:u16le src_fr:u16le kind:u8` (4 B) | fpext / fptrunc within freg file. |
+| `OP_LOAD_F` | 0x26 | `opc dst:u16le ptrreg:u16le` (3 B) | Load f64 (8-byte double) from memory into freg. |
+| `OP_STORE_F` | 0x27 | `opc val:u16le ptrreg:u16le` (3 B) | Store f64 from freg to memory. |
+| `OP_LOAD_F32` | 0x2D | `opc dst:u16le ptrreg:u16le` (3 B) | Load 4-byte float, fpext → freg. |
+| `OP_STORE_F32` | 0x2E | `opc val:u16le ptrreg:u16le` (3 B) | fptrunc freg → store 4-byte float. |
+| `OP_RET_F` | 0x28 | `opc src:u16le` (2 B) | Return f64 from freg. |
+| `OP_SELECT_F` | 0x29 | `opc dst:u16le cond:u16le t:u16le f:u16le` (5 B) | Ternary select on freg. |
+| `OP_FNEG` | 0x2C | `opc dst_fr:u16le src_fr:u16le` (3 B) | Negate freg value. |
+| `OP_FCAST_FV` | 0x2F | `opc dst:u16le src:u16le kind:u8` (4 B) | freg (f64) → vreg (i32): fptosi / fptoui. |
+| `OP_FCAST_FV64` | 0x30 | `opc dst64:u16le src:u16le kind:u8` (4 B) | freg (f64) → vreg64 (i64): fptosi / fptoui. |
+| `OP_FCAST_VF` | 0x31 | `opc dst:u16le src:u16le kind:u8` (4 B) | vreg (i32) → freg (f64): sitofp / uitofp. |
+| `OP_FCAST_V64F` | 0x32 | `opc dst:u16le src64:u16le kind:u8` (4 B) | vreg64 (i64) → freg (f64): sitofp / uitofp. |
 
 </details>
 
@@ -400,11 +400,11 @@ assignment; f32 destinations are narrowed on store or return.
 | Logical opcode | Value | Encoding | Description |
 |---|---|---|---|
 | `OP_JMP` | 0x0A | `opc target:u32le` (5 B) | Unconditional branch to bytecode offset. |
-| `OP_JMPC` | 0x0B | `opc cond:u8 tgt_t:u32le tgt_f:u32le` (10 B) | Conditional branch; `cond` is a vreg. |
-| `OP_SWITCH` | 0x18 | `opc cond:u8 ncases:u16le def:u32le [case:u32le tgt:u32le]*` (variable) | Multi-way branch. |
+| `OP_JMPC` | 0x0B | `opc cond:u16le tgt_t:u32le tgt_f:u32le` (10 B) | Conditional branch; `cond` is a vreg. |
+| `OP_SWITCH` | 0x18 | `opc cond:u16le ncases:u16le def:u32le [case:u32le tgt:u32le]*` (variable) | Multi-way branch. |
 | `OP_RET_VOID` | 0x0C | `opc` (1 B) | Return void. |
-| `OP_RET_INT` | 0x0D | `opc src:u8` (2 B) | Return i32 from vreg. |
-| `OP_RET_PTR` | 0x0E | `opc srcp:u8` (2 B) | Return ptr from preg. |
+| `OP_RET_INT` | 0x0D | `opc src:u16le` (2 B) | Return i32 from vreg. |
+| `OP_RET_PTR` | 0x0E | `opc srcp:u16le` (2 B) | Return ptr from preg. |
 
 </details>
 

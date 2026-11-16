@@ -307,12 +307,12 @@ uint32_t BytecodeEmitter::isize(Instruction* I) {
 		const unsigned Hdr = 3 + NA;  // fn + nargs + flags + types_lo + types_hi + args... wait
 		// Actually: fn(1) + nargs(1) + flags(1) + types_lo(1) + types_hi(1) + args(NA) = 5+NA
 		(void)Hdr;
-		if (Ty->isVoidTy())         return 6 + NA + Ind;
-		// Narrow ints (i1/i8/i16) share OP_CALL_INT / the i32 vreg file with i32.
-		if ((Ty->isIntegerTy() && Ty->getIntegerBitWidth() <= 32) || Ty->isPointerTy()) return 7 + NA + Ind;
-		if (Ty->isIntegerTy(64))    return 7 + NA + Ind;  // OP_CALL_INT64
-		if (Ty->isFloatTy() || Ty->isDoubleTy()) return 7 + NA + Ind;  // OP_CALL_F
-		if (isPtrI64PairTy(Ty))     return 8 + NA + Ind;  // OP_CALL_PAIR: two dsts
+		// opc + dst(s) u16 + fn + nargs + ind u16 + args u16
+		if (Ty->isVoidTy())         return 3 + 2*NA + 2*Ind;
+		if ((Ty->isIntegerTy() && Ty->getIntegerBitWidth() <= 32) || Ty->isPointerTy()) return 5 + 2*NA + 2*Ind;
+		if (Ty->isIntegerTy(64))    return 5 + 2*NA + 2*Ind;
+		if (Ty->isFloatTy() || Ty->isDoubleTy()) return 5 + 2*NA + 2*Ind;
+		if (isPtrI64PairTy(Ty))     return 7 + 2*NA + 2*Ind;
 		markUnsupported(I); return 0;
 	}
 	if (Op == Instruction::ExtractValue) {
@@ -324,7 +324,7 @@ uint32_t BytecodeEmitter::isize(Instruction* I) {
 		markUnsupported(I); return 0;
 	}
 	if (isBranchOpcode(Op))
-		return cast<BranchInst>(I)->isUnconditional() ? 5 : 10;
+		return cast<BranchInst>(I)->isUnconditional() ? 5 : 11;
 
 	if (Op == Instruction::Switch) {
 		auto* SI = cast<SwitchInst>(I);
@@ -333,7 +333,7 @@ uint32_t BytecodeEmitter::isize(Instruction* I) {
 		unsigned NC = SI->getNumCases();
 		if (NC > 0xFFFFu) { markUnsupported(I); return 0; }
 		// Encoding size = 1(opc) + 1(cond) + 2(ncases) + 4(def) + NC*(4+4)
-		return 8u + (uint32_t)NC * 8u;
+		return 9u + (uint32_t)NC * 8u;
 	}
 
 
@@ -521,10 +521,10 @@ void BytecodeEmitter::emit(Instruction* I) {
 			Instruction* Mul = FIt->second;
 			Value* C = (I->getOperand(0) == Mul) ? I->getOperand(1) : I->getOperand(0);
 			bop(OP_MULADD);
-			b8(xorSalt(newVR(I)));                // dst slot = this add's own result
-			b8(xorSalt(vr(Mul->getOperand(0))));  // a
-			b8(xorSalt(vr(Mul->getOperand(1))));  // b
-			b8(xorSalt(vr(C)));                   // c
+			b16(xorSalt(newVR(I)));                // dst slot = this add's own result
+			b16(xorSalt(vr(Mul->getOperand(0))));  // a
+			b16(xorSalt(vr(Mul->getOperand(1))));  // b
+			b16(xorSalt(vr(C)));                   // c
 			return;
 		}
 	}
@@ -538,10 +538,10 @@ void BytecodeEmitter::emit(Instruction* I) {
 			Instruction* Shl = SIt->second;
 			Value* C = (I->getOperand(0) == Shl) ? I->getOperand(1) : I->getOperand(0);
 			bop(OP_SHLADD);
-			b8(xorSalt(newVR(I)));                 // dst = this add's own result
-			b8(xorSalt(vr(Shl->getOperand(0))));   // a
-			b8(xorSalt(vr(Shl->getOperand(1))));   // b (shift amount)
-			b8(xorSalt(vr(C)));                    // c
+			b16(xorSalt(newVR(I)));                 // dst = this add's own result
+			b16(xorSalt(vr(Shl->getOperand(0))));   // a
+			b16(xorSalt(vr(Shl->getOperand(1))));   // b (shift amount)
+			b16(xorSalt(vr(C)));                    // c
 			return;
 		}
 	}
@@ -570,9 +570,9 @@ void BytecodeEmitter::emit(Instruction* I) {
 		}
 
 		bop(Is64 ? OP_BINOP64 : OP_BINOP);
-		b8(xorSalt(Is64 ? newVR64(I) : newVR(I)));
-		b8(xorSalt(Is64 ? vr64(I->getOperand(0)) : vr(I->getOperand(0))));
-		b8(xorSalt(Is64 ? vr64(I->getOperand(1)) : vr(I->getOperand(1))));
+		b16(xorSalt(Is64 ? newVR64(I) : newVR(I)));
+		b16(xorSalt(Is64 ? vr64(I->getOperand(0)) : vr(I->getOperand(0))));
+		b16(xorSalt(Is64 ? vr64(I->getOperand(1)) : vr(I->getOperand(1))));
 		b8(encBinSubop((uint8_t)Sub)); return;
 	}
 
@@ -585,8 +585,8 @@ void BytecodeEmitter::emit(Instruction* I) {
 			return;
 		}
 		bop(OP_FNEG);
-		b8(xorSalt(newFR(I)));             // Encrypted destination freg index
-		b8(xorSalt(fr(I->getOperand(0)))); // Encrypted source freg index
+		b16(xorSalt(newFR(I)));             // Encrypted destination freg index
+		b16(xorSalt(fr(I->getOperand(0)))); // Encrypted source freg index
 		return;
 	}
 
@@ -606,7 +606,7 @@ void BytecodeEmitter::emit(Instruction* I) {
 		uint8_t FSubByte = encFBinSubop((uint8_t)FSub);
 		if (Ty->isFloatTy()) FSubByte |= (uint8_t)FBS_F32_FLAG;
 		bop(OP_BINOP_F);
-		b8(xorSalt(newFR(I))); b8(xorSalt(fr(I->getOperand(0)))); b8(xorSalt(fr(I->getOperand(1)))); b8(FSubByte); return;
+		b16(xorSalt(newFR(I))); b16(xorSalt(fr(I->getOperand(0)))); b16(xorSalt(fr(I->getOperand(1)))); b8(FSubByte); return;
 	}
 
 
@@ -617,7 +617,7 @@ void BytecodeEmitter::emit(Instruction* I) {
 		Type* T0 = FCI->getOperand(0)->getType();
 		if (!(T0->isFloatTy() || T0->isDoubleTy())) { markUnsupported(I); return; }
 		bop(OP_FCMP);
-		b8(xorSalt(newVR(I))); b8(xorSalt(fr(FCI->getOperand(0)))); b8(xorSalt(fr(FCI->getOperand(1)))); b8(encFcmpPred((uint8_t)FCI->getPredicate())); return;
+		b16(xorSalt(newVR(I))); b16(xorSalt(fr(FCI->getOperand(0)))); b16(xorSalt(fr(FCI->getOperand(1)))); b8(encFcmpPred((uint8_t)FCI->getPredicate())); return;
 	}
 
 
@@ -625,39 +625,39 @@ void BytecodeEmitter::emit(Instruction* I) {
 	if (Op == Instruction::FPExt) {
 		Type* ST = I->getOperand(0)->getType();
 		if (!((ST->isFloatTy() || ST->isDoubleTy()) && (Ty->isFloatTy() || Ty->isDoubleTy()))) { markUnsupported(I); return; }
-		bop(OP_FCAST_FF); b8(xorSalt(newFR(I))); b8(xorSalt(fr(I->getOperand(0)))); b8(FK_FPEXT); return;
+		bop(OP_FCAST_FF); b16(xorSalt(newFR(I))); b16(xorSalt(fr(I->getOperand(0)))); b8(FK_FPEXT); return;
 	}
 	if (Op == Instruction::FPTrunc) {
 		Type* ST = I->getOperand(0)->getType();
 		if (!((ST->isFloatTy() || ST->isDoubleTy()) && (Ty->isFloatTy() || Ty->isDoubleTy()))) { markUnsupported(I); return; }
-		bop(OP_FCAST_FF); b8(xorSalt(newFR(I))); b8(xorSalt(fr(I->getOperand(0)))); b8(FK_FPTRUNC); return;
+		bop(OP_FCAST_FF); b16(xorSalt(newFR(I))); b16(xorSalt(fr(I->getOperand(0)))); b8(FK_FPTRUNC); return;
 	}
 	if (Op == Instruction::FPToSI) {
 		Type* ST = I->getOperand(0)->getType();
 		if (!(ST->isFloatTy() || ST->isDoubleTy())) { markUnsupported(I); return; }
-		if (Ty->isIntegerTy(32)) { bop(OP_FCAST_FV);   b8(xorSalt(newVR(I)));   b8(xorSalt(fr(I->getOperand(0)))); b8(FK_FPTOSI);   return; }
-		if (Ty->isIntegerTy(64)) { bop(OP_FCAST_FV64); b8(xorSalt(newVR64(I))); b8(xorSalt(fr(I->getOperand(0)))); b8(FK_FPTOSI64); return; }
+		if (Ty->isIntegerTy(32)) { bop(OP_FCAST_FV);   b16(xorSalt(newVR(I)));   b16(xorSalt(fr(I->getOperand(0)))); b8(FK_FPTOSI);   return; }
+		if (Ty->isIntegerTy(64)) { bop(OP_FCAST_FV64); b16(xorSalt(newVR64(I))); b16(xorSalt(fr(I->getOperand(0)))); b8(FK_FPTOSI64); return; }
 		markUnsupported(I); return;
 	}
 	if (Op == Instruction::FPToUI) {
 		Type* ST = I->getOperand(0)->getType();
 		if (!(ST->isFloatTy() || ST->isDoubleTy())) { markUnsupported(I); return; }
-		if (Ty->isIntegerTy(32)) { bop(OP_FCAST_FV);   b8(xorSalt(newVR(I)));   b8(xorSalt(fr(I->getOperand(0)))); b8(FK_FPTOUI);   return; }
-		if (Ty->isIntegerTy(64)) { bop(OP_FCAST_FV64); b8(xorSalt(newVR64(I))); b8(xorSalt(fr(I->getOperand(0)))); b8(FK_FPTOUI64); return; }
+		if (Ty->isIntegerTy(32)) { bop(OP_FCAST_FV);   b16(xorSalt(newVR(I)));   b16(xorSalt(fr(I->getOperand(0)))); b8(FK_FPTOUI);   return; }
+		if (Ty->isIntegerTy(64)) { bop(OP_FCAST_FV64); b16(xorSalt(newVR64(I))); b16(xorSalt(fr(I->getOperand(0)))); b8(FK_FPTOUI64); return; }
 		markUnsupported(I); return;
 	}
 	if (Op == Instruction::SIToFP) {
 		if (!(Ty->isFloatTy() || Ty->isDoubleTy())) { markUnsupported(I); return; }
 		Type* ST = I->getOperand(0)->getType();
-		if (ST->isIntegerTy(32)) { uint8_t K = FK_SITOFP;   if (Ty->isFloatTy()) K |= FCAST_F32_FLAG; bop(OP_FCAST_VF);   b8(xorSalt(newFR(I))); b8(xorSalt(vr(I->getOperand(0))));   b8(K); return; }
-		if (ST->isIntegerTy(64)) { uint8_t K = FK_SI64TOFP; if (Ty->isFloatTy()) K |= FCAST_F32_FLAG; bop(OP_FCAST_V64F); b8(xorSalt(newFR(I))); b8(xorSalt(vr64(I->getOperand(0)))); b8(K); return; }
+		if (ST->isIntegerTy(32)) { uint8_t K = FK_SITOFP;   if (Ty->isFloatTy()) K |= FCAST_F32_FLAG; bop(OP_FCAST_VF);   b16(xorSalt(newFR(I))); b16(xorSalt(vr(I->getOperand(0))));   b8(K); return; }
+		if (ST->isIntegerTy(64)) { uint8_t K = FK_SI64TOFP; if (Ty->isFloatTy()) K |= FCAST_F32_FLAG; bop(OP_FCAST_V64F); b16(xorSalt(newFR(I))); b16(xorSalt(vr64(I->getOperand(0)))); b8(K); return; }
 		markUnsupported(I); return;
 	}
 	if (Op == Instruction::UIToFP) {
 		if (!(Ty->isFloatTy() || Ty->isDoubleTy())) { markUnsupported(I); return; }
 		Type* ST = I->getOperand(0)->getType();
-		if (ST->isIntegerTy(32)) { uint8_t K = FK_UITOFP;   if (Ty->isFloatTy()) K |= FCAST_F32_FLAG; bop(OP_FCAST_VF);   b8(xorSalt(newFR(I))); b8(xorSalt(vr(I->getOperand(0))));   b8(K); return; }
-		if (ST->isIntegerTy(64)) { uint8_t K = FK_UI64TOFP; if (Ty->isFloatTy()) K |= FCAST_F32_FLAG; bop(OP_FCAST_V64F); b8(xorSalt(newFR(I))); b8(xorSalt(vr64(I->getOperand(0)))); b8(K); return; }
+		if (ST->isIntegerTy(32)) { uint8_t K = FK_UITOFP;   if (Ty->isFloatTy()) K |= FCAST_F32_FLAG; bop(OP_FCAST_VF);   b16(xorSalt(newFR(I))); b16(xorSalt(vr(I->getOperand(0))));   b8(K); return; }
+		if (ST->isIntegerTy(64)) { uint8_t K = FK_UI64TOFP; if (Ty->isFloatTy()) K |= FCAST_F32_FLAG; bop(OP_FCAST_V64F); b16(xorSalt(newFR(I))); b16(xorSalt(vr64(I->getOperand(0)))); b8(K); return; }
 		markUnsupported(I); return;
 	}
 
@@ -672,9 +672,9 @@ void BytecodeEmitter::emit(Instruction* I) {
 			Instruction* And = AIt->second;
 			CmpInst::Predicate P = Cmp->getPredicate();  // ICMP_EQ or ICMP_NE (scan-guaranteed)
 			bop(OP_ANDCMPZ);
-			b8(xorSalt(newVR(I)));                 // dst = this compare's own i32 result
-			b8(xorSalt(vr(And->getOperand(0))));   // a
-			b8(xorSalt(vr(And->getOperand(1))));   // b
+			b16(xorSalt(newVR(I)));                 // dst = this compare's own i32 result
+			b16(xorSalt(vr(And->getOperand(0))));   // a
+			b16(xorSalt(vr(And->getOperand(1))));   // b
 			b8(encIcmpPred((uint8_t)P));           // pred (EQ/NE, randISA-permuted)
 			return;
 		}
@@ -689,17 +689,17 @@ void BytecodeEmitter::emit(Instruction* I) {
 			T0->getIntegerBitWidth() <= 32 && T1->getIntegerBitWidth() <= 32 &&
 			T0->getIntegerBitWidth() == T1->getIntegerBitWidth()) {
 			bop(OP_ICMP);
-			b8(xorSalt(newVR(I)));
-			b8(xorSalt(vr(CI->getOperand(0))));
-			b8(xorSalt(vr(CI->getOperand(1))));
+			b16(xorSalt(newVR(I)));
+			b16(xorSalt(vr(CI->getOperand(0))));
+			b16(xorSalt(vr(CI->getOperand(1))));
 			b8(encIcmpPred((uint8_t)CI->getPredicate()));
 			return;
 		}
 		if (T0->isIntegerTy(64) && T1->isIntegerTy(64)) {
 			bop(OP_ICMP64);
-			b8(xorSalt(newVR(I)));
-			b8(xorSalt(vr64(CI->getOperand(0))));
-			b8(xorSalt(vr64(CI->getOperand(1))));
+			b16(xorSalt(newVR(I)));
+			b16(xorSalt(vr64(CI->getOperand(0))));
+			b16(xorSalt(vr64(CI->getOperand(1))));
 			b8(encIcmpPred((uint8_t)CI->getPredicate()));
 			return;
 
@@ -710,9 +710,9 @@ void BytecodeEmitter::emit(Instruction* I) {
 				markUnsupported(I); return;
 			}
 			bop(OP_ICMP_PTR);
-			b8(xorSalt(newVR(I)));
-			b8(xorSalt(pr(CI->getOperand(0))));
-			b8(xorSalt(pr(CI->getOperand(1))));
+			b16(xorSalt(newVR(I)));
+			b16(xorSalt(pr(CI->getOperand(0))));
+			b16(xorSalt(pr(CI->getOperand(1))));
 			b8(encIcmpPred((uint8_t)P));
 			return;
 		}
@@ -731,7 +731,7 @@ void BytecodeEmitter::emit(Instruction* I) {
 			(W == 1 || W == 8 || W == 16) &&
 			(DW == 8 || DW == 16 || DW == 32)) {
 			CastKind K = (W == 1) ? CK_ZEXT1 : (W == 8) ? CK_ZEXT8 : CK_ZEXT16;
-			bop(OP_CAST); b8(xorSalt(newVR(I))); b8(xorSalt(vr(I->getOperand(0)))); b8(encCastKind((uint8_t)K)); return;
+			bop(OP_CAST); b16(xorSalt(newVR(I))); b16(xorSalt(vr(I->getOperand(0)))); b8(encCastKind((uint8_t)K)); return;
 		}
 		if (Ty->isIntegerTy(64)) {
 			Cast64Kind K =
@@ -740,7 +740,7 @@ void BytecodeEmitter::emit(Instruction* I) {
 				(W == 16) ? C64_ZEXT16 :
 				(W == 32) ? C64_ZEXT32 : (Cast64Kind)0xFF;
 			if ((uint8_t)K == 0xFF) { markUnsupported(I); return; }
-			bop(OP_CAST64); b8(xorSalt(newVR64(I))); b8(xorSalt(vr(I->getOperand(0)))); b8(K); return;
+			bop(OP_CAST64); b16(xorSalt(newVR64(I))); b16(xorSalt(vr(I->getOperand(0)))); b8(K); return;
 		}
 		markUnsupported(I); return;
 	}
@@ -749,7 +749,7 @@ void BytecodeEmitter::emit(Instruction* I) {
 		if (Ty->isIntegerTy(32)) {
 			if (W != 8 && W != 16) { markUnsupported(I); return; }
 			CastKind K = (W == 8) ? CK_SEXT8 : CK_SEXT16;
-			bop(OP_CAST); b8(xorSalt(newVR(I))); b8(xorSalt(vr(I->getOperand(0)))); b8(encCastKind((uint8_t)K)); return;
+			bop(OP_CAST); b16(xorSalt(newVR(I))); b16(xorSalt(vr(I->getOperand(0)))); b8(encCastKind((uint8_t)K)); return;
 		}
 		if (Ty->isIntegerTy(64)) {
 			Cast64Kind K =
@@ -757,7 +757,7 @@ void BytecodeEmitter::emit(Instruction* I) {
 				(W == 16) ? C64_SEXT16 :
 				(W == 32) ? C64_SEXT32 : (Cast64Kind)0xFF;
 			if ((uint8_t)K == 0xFF) { markUnsupported(I); return; }
-			bop(OP_CAST64); b8(xorSalt(newVR64(I))); b8(xorSalt(vr(I->getOperand(0)))); b8(K); return;
+			bop(OP_CAST64); b16(xorSalt(newVR64(I))); b16(xorSalt(vr(I->getOperand(0)))); b8(K); return;
 		}
 		markUnsupported(I); return;
 	}
@@ -769,7 +769,7 @@ void BytecodeEmitter::emit(Instruction* I) {
 				markUnsupported(I); return;
 			}
 			CastKind K = (W == 1) ? CK_TRUNC1 : (W == 8) ? CK_TRUNC8 : CK_TRUNC16;
-			bop(OP_CAST); b8(xorSalt(newVR(I))); b8(xorSalt(vr(I->getOperand(0)))); b8(encCastKind((uint8_t)K)); return;
+			bop(OP_CAST); b16(xorSalt(newVR(I))); b16(xorSalt(vr(I->getOperand(0)))); b8(encCastKind((uint8_t)K)); return;
 		}
 		if (STy->isIntegerTy(64)) {
 			Cast64Kind K =
@@ -778,7 +778,7 @@ void BytecodeEmitter::emit(Instruction* I) {
 				(W == 16) ? C64_TRUNC16 :
 				(W == 32) ? C64_TRUNC32 : (Cast64Kind)0xFF;
 			if ((uint8_t)K == 0xFF) { markUnsupported(I); return; }
-			bop(OP_CAST64); b8(xorSalt(newVR(I))); b8(xorSalt(vr64(I->getOperand(0)))); b8(K); return;
+			bop(OP_CAST64); b16(xorSalt(newVR(I))); b16(xorSalt(vr64(I->getOperand(0)))); b8(K); return;
 		}
 		markUnsupported(I); return;
 	}
@@ -793,12 +793,12 @@ void BytecodeEmitter::emit(Instruction* I) {
 			auto* SI = cast<SelectInst>(I);
 			auto* Cmp = cast<ICmpInst>(CIt->second);
 			bop(OP_CMPSEL);
-			b8(xorSalt(newVR(I)));                          // dst = select result
-			b8(xorSalt(vr(Cmp->getOperand(0))));           // a
-			b8(xorSalt(vr(Cmp->getOperand(1))));           // b
+			b16(xorSalt(newVR(I)));                          // dst = select result
+			b16(xorSalt(vr(Cmp->getOperand(0))));           // a
+			b16(xorSalt(vr(Cmp->getOperand(1))));           // b
 			b8(encIcmpPred((uint8_t)Cmp->getPredicate())); // pred (randISA-permuted, matches ICMP handler)
-			b8(xorSalt(vr(SI->getTrueValue())));           // t
-			b8(xorSalt(vr(SI->getFalseValue())));          // f
+			b16(xorSalt(vr(SI->getTrueValue())));           // t
+			b16(xorSalt(vr(SI->getFalseValue())));          // f
 			return;
 		}
 	}
@@ -821,10 +821,10 @@ void BytecodeEmitter::emit(Instruction* I) {
 
 			bop(OP_SELECT);
 			b8(0); // kind 0 = int (vreg file)
-			b8(xorSalt(newVR(I)));
-			b8(xorSalt(vr(SI->getCondition())));
-			b8(xorSalt(vr(SI->getTrueValue())));
-			b8(xorSalt(vr(SI->getFalseValue())));
+			b16(xorSalt(newVR(I)));
+			b16(xorSalt(vr(SI->getCondition())));
+			b16(xorSalt(vr(SI->getTrueValue())));
+			b16(xorSalt(vr(SI->getFalseValue())));
 			return;
 		}
 
@@ -836,10 +836,10 @@ void BytecodeEmitter::emit(Instruction* I) {
 
 			bop(OP_SELECT);
 			b8(1); // kind 1 = ptr (preg file)
-			b8(xorSalt(newPR(I)));
-			b8(xorSalt(vr(SI->getCondition())));
-			b8(xorSalt(pr(SI->getTrueValue())));
-			b8(xorSalt(pr(SI->getFalseValue())));
+			b16(xorSalt(newPR(I)));
+			b16(xorSalt(vr(SI->getCondition())));
+			b16(xorSalt(pr(SI->getTrueValue())));
+			b16(xorSalt(pr(SI->getFalseValue())));
 			return;
 		}
 
@@ -850,10 +850,10 @@ void BytecodeEmitter::emit(Instruction* I) {
 			}
 			bop(OP_SELECT);
 			b8(2); // kind 2 = i64 (vreg64 file)
-			b8(xorSalt(newVR64(I)));
-			b8(xorSalt(vr(SI->getCondition())));
-			b8(xorSalt(vr64(SI->getTrueValue())));
-			b8(xorSalt(vr64(SI->getFalseValue())));
+			b16(xorSalt(newVR64(I)));
+			b16(xorSalt(vr(SI->getCondition())));
+			b16(xorSalt(vr64(SI->getTrueValue())));
+			b16(xorSalt(vr64(SI->getFalseValue())));
 			return;
 		}
 
@@ -864,8 +864,8 @@ void BytecodeEmitter::emit(Instruction* I) {
 				markUnsupported(I); return;
 			}
 			bop(OP_SELECT_F);
-			b8(xorSalt(newFR(I))); b8(xorSalt(vr(SI->getCondition())));
-			b8(xorSalt(fr(SI->getTrueValue()))); b8(xorSalt(fr(SI->getFalseValue())));
+			b16(xorSalt(newFR(I))); b16(xorSalt(vr(SI->getCondition())));
+			b16(xorSalt(fr(SI->getTrueValue()))); b16(xorSalt(fr(SI->getFalseValue())));
 			return;
 
 		}
@@ -880,41 +880,41 @@ void BytecodeEmitter::emit(Instruction* I) {
 
 
 	if (Op == Instruction::PtrToInt && Ty->isIntegerTy(32)) {
-		bop(OP_PTRTOINT); b8(xorSalt(newVR(I))); b8(xorSalt(pr(I->getOperand(0)))); return;
+		bop(OP_PTRTOINT); b16(xorSalt(newVR(I))); b16(xorSalt(pr(I->getOperand(0)))); return;
 	}
 	if (Op == Instruction::PtrToInt && Ty->isIntegerTy(64)) {
-		bop(OP_PTRTOINT64); b8(xorSalt(newVR64(I))); b8(xorSalt(pr(I->getOperand(0)))); return;
+		bop(OP_PTRTOINT64); b16(xorSalt(newVR64(I))); b16(xorSalt(pr(I->getOperand(0)))); return;
 	}
 	if (Op == Instruction::IntToPtr && Ty->isPointerTy()) {
 		Type* ST = I->getOperand(0)->getType();
 		if (ST->isIntegerTy(32)) {
-			bop(OP_INTTOPTR); b8(xorSalt(newPR(I))); b8(xorSalt(vr(I->getOperand(0)))); return;
+			bop(OP_INTTOPTR); b16(xorSalt(newPR(I))); b16(xorSalt(vr(I->getOperand(0)))); return;
 		}
 		if (ST->isIntegerTy(64)) {
-			bop(OP_INTTOPTR64); b8(xorSalt(newPR(I))); b8(xorSalt(vr64(I->getOperand(0)))); return;
+			bop(OP_INTTOPTR64); b16(xorSalt(newPR(I))); b16(xorSalt(vr64(I->getOperand(0)))); return;
 		}
 		markUnsupported(I); return;
 	}
 	if (Op == Instruction::Load && (Ty->isIntegerTy(1) || Ty->isIntegerTy(8))) {
-		uint8_t D = newVR(I);
-		bop(OP_LOAD8); b8(xorSalt(D)); b8(xorSalt(pr(cast<LoadInst>(I)->getPointerOperand())));
+		uint16_t D = newVR(I);
+		bop(OP_LOAD8); b16(xorSalt(D)); b16(xorSalt(pr(cast<LoadInst>(I)->getPointerOperand())));
 		// load i1: byte in memory, keep only the low bit (CK_TRUNC1) in the same slot.
 		if (Ty->isIntegerTy(1)) {
-			bop(OP_CAST); b8(xorSalt(D)); b8(xorSalt(D)); b8(encCastKind((uint8_t)CK_TRUNC1));
+			bop(OP_CAST); b16(xorSalt(D)); b16(xorSalt(D)); b8(encCastKind((uint8_t)CK_TRUNC1));
 		}
 		return;
 	}
 	if (Op == Instruction::Load && Ty->isIntegerTy(16)) {
-		bop(OP_LOAD16); b8(xorSalt(newVR(I))); b8(xorSalt(pr(cast<LoadInst>(I)->getPointerOperand()))); return;
+		bop(OP_LOAD16); b16(xorSalt(newVR(I))); b16(xorSalt(pr(cast<LoadInst>(I)->getPointerOperand()))); return;
 	}
 	if (Op == Instruction::Load && Ty->isIntegerTy(32)) {
-		bop(OP_LOAD32); b8(xorSalt(newVR(I))); b8(xorSalt(pr(cast<LoadInst>(I)->getPointerOperand()))); return;
+		bop(OP_LOAD32); b16(xorSalt(newVR(I))); b16(xorSalt(pr(cast<LoadInst>(I)->getPointerOperand()))); return;
 	}
 	if (Op == Instruction::Load && Ty->isIntegerTy(64)) {
-		bop(OP_LOAD64); b8(xorSalt(newVR64(I))); b8(xorSalt(pr(cast<LoadInst>(I)->getPointerOperand()))); return;
+		bop(OP_LOAD64); b16(xorSalt(newVR64(I))); b16(xorSalt(pr(cast<LoadInst>(I)->getPointerOperand()))); return;
 	}
 	if (Op == Instruction::Load && Ty->isPointerTy()) {
-		bop(OP_LOADPTR); b8(xorSalt(newPR(I))); b8(xorSalt(pr(cast<LoadInst>(I)->getPointerOperand()))); return;
+		bop(OP_LOADPTR); b16(xorSalt(newPR(I))); b16(xorSalt(pr(cast<LoadInst>(I)->getPointerOperand()))); return;
 	}
 	// load f64 → OP_LOAD_F (8-byte); load f32 → OP_LOAD_F32 (4-byte)
 	// in run() widens local float allocas to double, so most float loads
@@ -922,7 +922,7 @@ void BytecodeEmitter::emit(Instruction* I) {
 	// float load (e.g. from a float* parameter) is correctly handled by OP_LOAD_F32.
 	if (Op == Instruction::Load && (Ty->isFloatTy() || Ty->isDoubleTy())) {
 		VMOp LoadOp = Ty->isFloatTy() ? OP_LOAD_F32 : OP_LOAD_F;
-		bop(LoadOp); b8(xorSalt(newFR(I))); b8(xorSalt(pr(cast<LoadInst>(I)->getPointerOperand()))); return;
+		bop(LoadOp); b16(xorSalt(newFR(I))); b16(xorSalt(pr(cast<LoadInst>(I)->getPointerOperand()))); return;
 	}
 
 	if (Op == Instruction::Store) {
@@ -930,24 +930,24 @@ void BytecodeEmitter::emit(Instruction* I) {
 		Type* VT = SI->getValueOperand()->getType();
 		// i1 and i8 both store one byte via OP_STORE8.
 		if (VT->isIntegerTy(1) || VT->isIntegerTy(8)) {
-			bop(OP_STORE8); b8(xorSalt(vr(SI->getValueOperand()))); b8(xorSalt(pr(SI->getPointerOperand()))); return;
+			bop(OP_STORE8); b16(xorSalt(vr(SI->getValueOperand()))); b16(xorSalt(pr(SI->getPointerOperand()))); return;
 		}
 		if (VT->isIntegerTy(16)) {
-			bop(OP_STORE16); b8(xorSalt(vr(SI->getValueOperand()))); b8(xorSalt(pr(SI->getPointerOperand()))); return;
+			bop(OP_STORE16); b16(xorSalt(vr(SI->getValueOperand()))); b16(xorSalt(pr(SI->getPointerOperand()))); return;
 		}
 		if (VT->isIntegerTy(32)) {
-			bop(OP_STORE32); b8(xorSalt(vr(SI->getValueOperand()))); b8(xorSalt(pr(SI->getPointerOperand()))); return;
+			bop(OP_STORE32); b16(xorSalt(vr(SI->getValueOperand()))); b16(xorSalt(pr(SI->getPointerOperand()))); return;
 		}
 		if (VT->isIntegerTy(64)) {
-			bop(OP_STORE64); b8(xorSalt(vr64(SI->getValueOperand()))); b8(xorSalt(pr(SI->getPointerOperand()))); return;
+			bop(OP_STORE64); b16(xorSalt(vr64(SI->getValueOperand()))); b16(xorSalt(pr(SI->getPointerOperand()))); return;
 		}
 		if (VT->isPointerTy()) {
-			bop(OP_STOREPTR); b8(xorSalt(pr(SI->getValueOperand()))); b8(xorSalt(pr(SI->getPointerOperand()))); return;
+			bop(OP_STOREPTR); b16(xorSalt(pr(SI->getValueOperand()))); b16(xorSalt(pr(SI->getPointerOperand()))); return;
 		}
 		// store f64 → OP_STORE_F (8-byte); store f32 → OP_STORE_F32 (4-byte)
 		if (VT->isFloatTy() || VT->isDoubleTy()) {
 			VMOp StoreOp = VT->isFloatTy() ? OP_STORE_F32 : OP_STORE_F;
-			bop(StoreOp); b8(xorSalt(fr(SI->getValueOperand()))); b8(xorSalt(pr(SI->getPointerOperand()))); return;
+			bop(StoreOp); b16(xorSalt(fr(SI->getValueOperand()))); b16(xorSalt(pr(SI->getPointerOperand()))); return;
 		}
 		// store {ptr,i64}: STOREPTR at base, GEP to field1, STORE64.
 		if (isPtrI64PairTy(VT)) {
@@ -963,18 +963,18 @@ void BytecodeEmitter::emit(Instruction* I) {
 				return;
 			}
 			Value* Base = SI->getPointerOperand();
-			uint8_t Preg = PIt->second.first;
-			uint8_t V64 = PIt->second.second;
-			uint8_t Scratch = allocScratchPR();
+			uint16_t Preg = PIt->second.first;
+			uint16_t V64 = PIt->second.second;
+			uint16_t Scratch = allocScratchPR();
 			if (Scratch == kInvalidSlot) {
-				markUnsupported(I, "preg file overflow (>254 slots)");
+				markUnsupported(I, "preg file overflow (>4095 slots)");
 				return;
 			}
 			auto* CIV = ConstantInt::get(Type::getInt32Ty(I->getContext()), Off1);
-			bop(OP_STOREPTR); b8(xorSalt(Preg)); b8(xorSalt(pr(Base)));
-			bop(OP_GEP); b8(xorSalt(Scratch)); b8(xorSalt(pr(Base)));
-			b8(xorSalt(vr(CIV))); b8(1); b8(0);
-			bop(OP_STORE64); b8(xorSalt(V64)); b8(xorSalt(Scratch));
+			bop(OP_STOREPTR); b16(xorSalt(Preg)); b16(xorSalt(pr(Base)));
+			bop(OP_GEP); b16(xorSalt(Scratch)); b16(xorSalt(pr(Base)));
+			b16(xorSalt(vr(CIV))); b8(1); b8(0);
+			bop(OP_STORE64); b16(xorSalt(V64)); b16(xorSalt(Scratch));
 			freeScratchPR(Scratch);
 			return;
 		}
@@ -998,18 +998,18 @@ void BytecodeEmitter::emit(Instruction* I) {
 					Constant* CIV = ConstantInt::getSigned(
 						Type::getInt32Ty(GEP->getContext()), COff.getSExtValue());
 					bop(OP_GEP);
-					b8(xorSalt(newPR(I)));
-					b8(xorSalt(pr(GEP->getPointerOperand())));
-					b8(xorSalt(vr(CIV)));
+					b16(xorSalt(newPR(I)));
+					b16(xorSalt(pr(GEP->getPointerOperand())));
+					b16(xorSalt(vr(CIV)));
 					b8(1);
 					b8(0);
 				} else {
 					Constant* CIV = ConstantInt::getSigned(
 						Type::getInt64Ty(GEP->getContext()), COff.getSExtValue());
 					bop(OP_GEP64);
-					b8(xorSalt(newPR(I)));
-					b8(xorSalt(pr(GEP->getPointerOperand())));
-					b8(xorSalt(vr64(CIV)));
+					b16(xorSalt(newPR(I)));
+					b16(xorSalt(pr(GEP->getPointerOperand())));
+					b16(xorSalt(vr64(CIV)));
 					b8(1);
 					b8(0);
 				}
@@ -1044,9 +1044,9 @@ void BytecodeEmitter::emit(Instruction* I) {
 		uint64_t ESz = DL->getTypeStoreSize(ElemTy);
 		uint16_t ElemSz = (ESz > 0xFFFFu) ? 0xFFFFu : (uint16_t)ESz;
 		bop(IdxIs64 ? OP_GEP64 : OP_GEP);
-		b8(xorSalt(newPR(I)));
-		b8(xorSalt(pr(GEP->getPointerOperand())));
-		b8(xorSalt(IdxIs64 ? vr64(IdxV) : vr(IdxV)));
+		b16(xorSalt(newPR(I)));
+		b16(xorSalt(pr(GEP->getPointerOperand())));
+		b16(xorSalt(IdxIs64 ? vr64(IdxV) : vr(IdxV)));
 		b8((uint8_t)(ElemSz & 0xFF));          // elemsz lo
 		b8((uint8_t)(ElemSz >> 8));            // elemsz hi
 		return;
@@ -1072,9 +1072,9 @@ void BytecodeEmitter::emit(Instruction* I) {
 				uint8_t FSubByte = (uint8_t)FBS_FREM;
 				if (RT->isFloatTy()) FSubByte |= (uint8_t)FBS_F32_FLAG;
 				bop(OP_BINOP_F);
-				b8(xorSalt(newFR(CI)));
-				b8(xorSalt(fr(CI->getArgOperand(0))));
-				b8(xorSalt(fr(CI->getArgOperand(1))));
+				b16(xorSalt(newFR(CI)));
+				b16(xorSalt(fr(CI->getArgOperand(0))));
+				b16(xorSalt(fr(CI->getArgOperand(1))));
 				b8(FSubByte); return;
 			}
 		}
@@ -1103,7 +1103,7 @@ void BytecodeEmitter::emit(Instruction* I) {
 		// Only Constants go into the callee global. An indirect target is an
 		// instruction; stripBody() deletes it before that global is built.
 		const bool IndCall = !isa<Constant>(Fn);
-		uint8_t IndPreg = 0;
+		uint16_t IndPreg = 0;
 		if (IndCall) {
 			if (!PR.count(Fn)) {
 				markUnsupported(I, "indirect callee not in preg file");
@@ -1126,39 +1126,39 @@ void BytecodeEmitter::emit(Instruction* I) {
 			bop(OP_CALL_VOID);
 		}
 		else if (Ty->isIntegerTy() && Ty->getIntegerBitWidth() <= 32) {
-			bop(OP_CALL_INT);   b8(xorSalt(newVR(I)));
+			bop(OP_CALL_INT);   b16(xorSalt(newVR(I)));
 		}
 		else if (Ty->isPointerTy()) {
-			bop(OP_CALL_PTR);   b8(xorSalt(newPR(I)));
+			bop(OP_CALL_PTR);   b16(xorSalt(newPR(I)));
 		}
 		else if (Ty->isIntegerTy(64)) {
-			bop(OP_CALL_INT64); b8(xorSalt(newVR64(I)));
+			bop(OP_CALL_INT64); b16(xorSalt(newVR64(I)));
 		}
 		else if (Ty->isFloatTy() || Ty->isDoubleTy()) {
-			bop(OP_CALL_F);     b8(xorSalt(newFR(I)));
+			bop(OP_CALL_F);     b16(xorSalt(newFR(I)));
 		}
 		else if (isPtrI64PairTy(Ty)) {
-			uint8_t DP = newPR(I);
-			uint8_t D64 = newVR64(I);
+			uint16_t DP = newPR(I);
+			uint16_t D64 = newVR64(I);
 			PairSlots[I] = { DP, D64 };
 			bop(OP_CALL_PAIR);
-			b8(xorSalt(DP));
-			b8(xorSalt(D64));
+			b16(xorSalt(DP));
+			b16(xorSalt(D64));
 		}
 		else { markUnsupported(I); return; }
 		// Common header: fn, nargs. Bit 7 of nargs = indirect: next byte is the
 		// preg holding the callee pointer. fn still indexes the FTy table.
 		b8(FI); b8(IndCall ? (uint8_t)(NA | 0x80) : NA);
-		if (IndCall) b8(xorSalt(IndPreg));
+		if (IndCall) b16(xorSalt(IndPreg));
 
 		// Per-arg register indices
 		for (unsigned A = 0; A < NA; ++A) {
 			Value* Arg = CI->getArgOperand(A);
 			Type* AT = Arg->getType();
-			if (AT->isPointerTy())                        b8(xorSalt(pr(Arg)));
-			else if (AT->isIntegerTy(64))                 b8(xorSalt(vr64(Arg)));
-			else if (AT->isFloatTy() || AT->isDoubleTy()) b8(xorSalt(fr(Arg)));
-			else										  b8(xorSalt(vr(Arg)));
+			if (AT->isPointerTy())                        b16(xorSalt(pr(Arg)));
+			else if (AT->isIntegerTy(64))                 b16(xorSalt(vr64(Arg)));
+			else if (AT->isFloatTy() || AT->isDoubleTy()) b16(xorSalt(fr(Arg)));
+			else										  b16(xorSalt(vr(Arg)));
 		}
 		return;
 	}
@@ -1186,7 +1186,7 @@ void BytecodeEmitter::emit(Instruction* I) {
 			bop(OP_JMP); fixup_u32(BI->getSuccessor(0));
 		}
 		else {
-			bop(OP_JMPC); b8(xorSalt(vr(BI->getCondition())));
+			bop(OP_JMPC); b16(xorSalt(vr(BI->getCondition())));
 			fixup_u32(BI->getSuccessor(0));
 			fixup_u32(BI->getSuccessor(1));
 		}
@@ -1201,7 +1201,7 @@ void BytecodeEmitter::emit(Instruction* I) {
 		if (NC > 0xFFFFu) { markUnsupported(I); return; }
 
 		bop(OP_SWITCH);
-		b8(xorSalt(vr(SI->getCondition())));
+		b16(xorSalt(vr(SI->getCondition())));
 		u16((uint16_t)NC);
 		fixup_u32(SI->getDefaultDest());
 		for (auto& C : SI->cases()) {
@@ -1219,10 +1219,10 @@ void BytecodeEmitter::emit(Instruction* I) {
 		auto* RI = cast<ReturnInst>(I);
 		Value* RV = RI->getReturnValue();
 		if (!RV) { bop(OP_RET_VOID); return; }
-		if (RV->getType()->isPointerTy()) { bop(OP_RET_PTR); b8(xorSalt(pr(RV)));   return; }
-		if (RV->getType()->isIntegerTy(64)) { bop(OP_RET_INT); b8(xorSalt(vr64(RV))); return; }
-		if (RV->getType()->isFloatTy() || RV->getType()->isDoubleTy()) { bop(OP_RET_F);   b8(xorSalt(fr(RV)));   return; }
-		bop(OP_RET_INT); b8(xorSalt(vr(RV)));
+		if (RV->getType()->isPointerTy()) { bop(OP_RET_PTR); b16(xorSalt(pr(RV)));   return; }
+		if (RV->getType()->isIntegerTy(64)) { bop(OP_RET_INT); b16(xorSalt(vr64(RV))); return; }
+		if (RV->getType()->isFloatTy() || RV->getType()->isDoubleTy()) { bop(OP_RET_F);   b16(xorSalt(fr(RV)));   return; }
+		bop(OP_RET_INT); b16(xorSalt(vr(RV)));
 
 		return;
 	}
@@ -1353,7 +1353,7 @@ void BytecodeEmitter::computeLastUsesInBB(Function& F) {
 	}
 }
 
-bool BytecodeEmitter::run(Function& F, uint8_t S, const DataLayout& D) {
+bool BytecodeEmitter::run(Function& F, uint16_t S, const DataLayout& D) {
 
 	// Reset per-run state
 	BC.clear();
@@ -1520,8 +1520,8 @@ bool BytecodeEmitter::run(Function& F, uint8_t S, const DataLayout& D) {
 		// {ptr, i64} call result → dual slots; extractvalue aliases them.
 		// Pinned: shared slots must not enter the free list twice.
 		if (isPtrI64PairTy(Ty)) {
-			uint8_t DP = newPR(&I);
-			uint8_t D64 = newVR64(&I);
+			uint16_t DP = newPR(&I);
+			uint16_t D64 = newVR64(&I);
 			PairSlots[&I] = { DP, D64 };
 			pin(&I);
 			releaseDeadAt(&I);
@@ -1593,17 +1593,17 @@ bool BytecodeEmitter::run(Function& F, uint8_t S, const DataLayout& D) {
 
 		for (auto& KV : ImmLoads) {
 			bop(OP_LOADI);
-			b8(xorSalt(KV.first));
+			b16(xorSalt(KV.first));
 			u32((uint32_t)KV.second->getZExtValue());
 		}
 		for (auto& KV : ImmLoads64) {
 			bop(OP_LOADI64);
-			b8(xorSalt(KV.first));
+			b16(xorSalt(KV.first));
 			u64(KV.second->getZExtValue());
 		}
 		for (auto& KV : ImmLoadsF) {
 			bop(OP_LOADI_F);
-			b8(xorSalt(KV.first));
+			b16(xorSalt(KV.first));
 			double DV = KV.second->getType()->isDoubleTy()
 				? KV.second->getValueAPF().convertToDouble()
 				: (double)KV.second->getValueAPF().convertToFloat();

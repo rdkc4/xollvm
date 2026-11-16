@@ -35,6 +35,7 @@ REQUIRED_PATTERNS = frozenset({
     "SHELL_VARARGS",
     "SHELL_SRET",
     "SHELL_NAT",
+    "REGFILE_U16_STRESS",
 })
 
 

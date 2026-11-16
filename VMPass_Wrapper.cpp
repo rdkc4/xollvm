@@ -335,7 +335,7 @@ void VMImpl::buildWrapper() {
 				Value* V = &A;
 				if (V->getType() != I64Ty) V = B.CreateZExtOrTrunc(V, I64Ty, "vm.w64");
 				if (DoRegEncrypt) {
-					uint8_t Slot = E.VR64.lookup(&A);
+					uint16_t Slot = E.VR64.lookup(&A);
 					V = B.CreateXor(V, blindI64(Reg64Keys[Slot]), "vm.w64.enc");
 				}
 				B.CreateStore(V, B.CreateGEP(I64Ty, WRegs64, Idx));
@@ -350,7 +350,7 @@ void VMImpl::buildWrapper() {
 
 
 			if (DoRegEncrypt) {
-				uint8_t Slot = E.VR.lookup(&A);
+				uint16_t Slot = E.VR.lookup(&A);
 				V = B.CreateXor(V, blindI32(RegKeys[Slot]), "vm.wax.enc");
 			}
 			B.CreateStore(V, B.CreateGEP(I32Ty, WRegs, Idx));
@@ -430,7 +430,7 @@ void VMImpl::buildWrapper() {
 		for (Argument& A : F.args()) {
 			Type* AT = A.getType();
 			if (!AT->isFloatTy() && !AT->isDoubleTy()) continue;
-			uint8_t Slot = E.FR.lookup(&A);
+			uint16_t Slot = E.FR.lookup(&A);
 			Value* V = AT->isDoubleTy() ? (Value*)&A
 				: B.CreateFPExt(&A, DoubleTy, "vm.wfa");
 			if (DoRegEncrypt) {

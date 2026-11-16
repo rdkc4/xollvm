@@ -25,44 +25,46 @@ namespace llvm {
 	// ============================================================================
 
 	enum VMOp : uint8_t {
+		// Register-file indices are u16le (soft cap 4096). fn/nargs stay u8.
 		// ── Integer / pointer opcodes (0x00..0x20) ─────────────
-		OP_LOADI = 0x00,  // dst:u8 imm:i32le
-		OP_MOVR = 0x01,  // dst:u8 src:u8
-		OP_BINOP = 0x02,  // dst:u8 a:u8 b:u8 subop:u8
-		OP_ICMP = 0x03,  // dst:u8 a:u8 b:u8 pred:u8
-		OP_CAST = 0x04,  // dst:u8 src:u8 kind:u8
-		OP_PTRTOINT = 0x05,  // dst:u8 srcp:u8
-		OP_INTTOPTR = 0x06,  // dstp:u8 src:u8
-		OP_LOAD32 = 0x07,  // dst:u8 ptrreg:u8
-		OP_STORE32 = 0x08,  // val:u8 ptrreg:u8
-		OP_GEP = 0x09,  // dstp:u8 basep:u8 idx:u8 elemsz:u16le
+		OP_LOADI = 0x00,  // dst:u16le imm:i32le  (7 B)
+		OP_MOVR = 0x01,  // dst:u16le src:u16le  (5 B)
+		OP_BINOP = 0x02,  // dst:u16le a:u16le b:u16le subop:u8  (8 B)
+		OP_ICMP = 0x03,  // dst:u16le a:u16le b:u16le pred:u8  (8 B)
+		OP_CAST = 0x04,  // dst:u16le src:u16le kind:u8  (6 B)
+		OP_PTRTOINT = 0x05,  // dst:u16le srcp:u16le  (5 B)
+		OP_INTTOPTR = 0x06,  // dstp:u16le src:u16le  (5 B)
+		OP_LOAD32 = 0x07,  // dst:u16le ptrreg:u16le  (5 B)
+		OP_STORE32 = 0x08,  // val:u16le ptrreg:u16le  (5 B)
+		OP_GEP = 0x09,  // dstp:u16le basep:u16le idx:u16le elemsz:u16le  (9 B)
 		OP_JMP = 0x0A,  // target:u32le
-		OP_JMPC = 0x0B,  // cond:u8 tgt_t:u32 tgt_f:u32
+		OP_JMPC = 0x0B,  // cond:u16le tgt_t:u32 tgt_f:u32  (11 B)
 		OP_RET_VOID = 0x0C,
-		OP_RET_INT = 0x0D,  // src:u8
-		OP_RET_PTR = 0x0E,  // srcp:u8
-		// Step 02: argtypes is now u16le (2 bits per arg: 00=vreg,01=preg,10=vreg64,11=freg)
+		OP_RET_INT = 0x0D,  // src:u16le  (3 B)
+		OP_RET_PTR = 0x0E,  // srcp:u16le  (3 B)
+		// Step 02: argtypes is u16le (2 bits per arg: 00=vreg,01=preg,10=vreg64,11=freg)
 		//          nargs is followed by a flags byte: bit0 = isVarArg
-		OP_CALL_VOID = 0x0F,  // fn:u8 nargs:u8 flags:u8 types:u16le [arg:u8 * nargs]
-		OP_CALL_INT = 0x10,  // dst:u8 fn:u8 nargs:u8 flags:u8 types:u16le [arg:u8 * nargs]  i1/i8/i16/i32 → i32 vreg
-		OP_CALL_PTR = 0x11,  // dstp:u8 fn:u8 nargs:u8 flags:u8 types:u16le [arg:u8 * nargs]
-		OP_CALL_INT64 = 0x2A,  // dst64:u8 fn:u8 nargs:u8 flags:u8 types:u16le [arg:u8 * nargs]  [Step 02]
-		OP_CALL_F = 0x2B,  // dstf:u8 fn:u8 nargs:u8 flags:u8 types:u16le [arg:u8 * nargs]   [Step 02]
-		OP_SELECT = 0x12,  // kind:u8 dst:u8 cond:u8 t:u8 f:u8
-		OP_PTRTOINT64 = 0x13,  // dst64:u8 srcp:u8
-		OP_LOAD64 = 0x14,  // dst64:u8 ptrreg:u8
-		OP_STORE64 = 0x15,  // val64:u8 ptrreg:u8
-		OP_CAST64 = 0x16,  // dst:u8 src:u8 kind:u8
-		OP_BINOP64 = 0x17,  // dst64:u8 a64:u8 b64:u8 subop:u8
-		OP_SWITCH = 0x18,  // cond:u8 ncases:u16le def:u32le [case:u32le tgt:u32le]*ncases
-		OP_GEP64 = 0x19,  // dstp:u8 basep:u8 idx64:u8 elemsz:u16le
-		OP_ICMP64 = 0x1A,  // dst:u8 a64:u8 b64:u8 pred:u8
-		OP_LOAD8 = 0x1B,  // dst:u8 ptrreg:u8
-		OP_STORE8 = 0x1C,  // val:u8 ptrreg:u8
-		OP_LOAD16 = 0x1D,  // dst:u8 ptrreg:u8
-		OP_STORE16 = 0x1E,  // val:u8 ptrreg:u8
-		OP_LOADPTR = 0x1F,  // dstp:u8 ptrreg:u8
-		OP_STOREPTR = 0x20,  // valp:u8 ptrreg:u8
+		//          CALL arg register indices are u16le; fn/nargs remain u8.
+		OP_CALL_VOID = 0x0F,  // fn:u8 nargs:u8 flags:u8 types:u16le [arg:u16le * nargs]
+		OP_CALL_INT = 0x10,  // dst:u16le fn:u8 nargs:u8 flags:u8 types:u16le [arg:u16le * nargs]
+		OP_CALL_PTR = 0x11,  // dstp:u16le fn:u8 nargs:u8 flags:u8 types:u16le [arg:u16le * nargs]
+		OP_CALL_INT64 = 0x2A,  // dst64:u16le fn:u8 nargs:u8 flags:u8 types:u16le [arg:u16le * nargs]
+		OP_CALL_F = 0x2B,  // dstf:u16le fn:u8 nargs:u8 flags:u8 types:u16le [arg:u16le * nargs]
+		OP_SELECT = 0x12,  // kind:u8 dst:u16le cond:u16le t:u16le f:u16le  (10 B)
+		OP_PTRTOINT64 = 0x13,  // dst64:u16le srcp:u16le  (5 B)
+		OP_LOAD64 = 0x14,  // dst64:u16le ptrreg:u16le  (5 B)
+		OP_STORE64 = 0x15,  // val64:u16le ptrreg:u16le  (5 B)
+		OP_CAST64 = 0x16,  // dst:u16le src:u16le kind:u8  (6 B)
+		OP_BINOP64 = 0x17,  // dst64:u16le a64:u16le b64:u16le subop:u8  (8 B)
+		OP_SWITCH = 0x18,  // cond:u16le ncases:u16le def:u32le [case:u32le tgt:u32le]*ncases
+		OP_GEP64 = 0x19,  // dstp:u16le basep:u16le idx64:u16le elemsz:u16le  (9 B)
+		OP_ICMP64 = 0x1A,  // dst:u16le a64:u16le b64:u16le pred:u8  (8 B)
+		OP_LOAD8 = 0x1B,  // dst:u16le ptrreg:u16le  (5 B)
+		OP_STORE8 = 0x1C,  // val:u16le ptrreg:u16le  (5 B)
+		OP_LOAD16 = 0x1D,  // dst:u16le ptrreg:u16le  (5 B)
+		OP_STORE16 = 0x1E,  // val:u16le ptrreg:u16le  (5 B)
+		OP_LOADPTR = 0x1F,  // dstp:u16le ptrreg:u16le  (5 B)
+		OP_STOREPTR = 0x20,  // valp:u16le ptrreg:u16le  (5 B
 
 		// ── Floating-point opcodes (addition, 0x21..0x29) ─────────
 		//
@@ -77,65 +79,42 @@ namespace llvm {
 		//   as a full u8 for alignment / simplicity.
 		// FCmp result lands in the vreg (i32) register file as 0 or 1.
 
-		OP_LOADI_F = 0x21,  // dst:u8 imm:f64le  (1+1+8 = 10 bytes)
-		OP_MOVR_F = 0x22,  // dst:u8 src:u8     (1+1+1 =  3 bytes)
-		OP_BINOP_F = 0x23,  // dst:u8 a:u8 b:u8 subop:u8  (5 bytes) — see FBinSubop
-		OP_FCMP = 0x24,  // dst:u8 a:u8 b:u8 pred:u8   (5 bytes) — result → vreg i32
-		OP_FCAST_FF = 0x25,  // dst_fr:u8 src_fr:u8 kind:u8 (4 bytes) — FK_FPEXT / FK_FPTRUNC
-		OP_LOAD_F = 0x26,  // dst:u8 ptrreg:u8            (3 bytes) — load f64 from memory  (double* only)
-		OP_STORE_F = 0x27,  // val:u8 ptrreg:u8            (3 bytes) — store f64 from memory  (double* only)
-		OP_RET_F = 0x28,  // src:u8                      (2 bytes) — return f64 from freg
-		OP_SELECT_F = 0x29,  // dst:u8 cond:u8 t:u8 f:u8   (5 bytes) — ternary on fregs
+		OP_LOADI_F = 0x21,  // dst:u16le imm:f64le  (11 B)
+		OP_MOVR_F = 0x22,  // dst:u16le src:u16le  (5 B)
+		OP_BINOP_F = 0x23,  // dst:u16le a:u16le b:u16le subop:u8  (8 B) — see FBinSubop
+		OP_FCMP = 0x24,  // dst:u16le a:u16le b:u16le pred:u8  (8 B) — result → vreg i32
+		OP_FCAST_FF = 0x25,  // dst_fr:u16le src_fr:u16le kind:u8  (6 B) — FK_FPEXT / FK_FPTRUNC
+		OP_LOAD_F = 0x26,  // dst:u16le ptrreg:u16le  (5 B) — load f64 from memory
+		OP_STORE_F = 0x27,  // val:u16le ptrreg:u16le  (5 B) — store f64
+		OP_RET_F = 0x28,  // src:u16le  (3 B) — return f64 from freg
+		OP_SELECT_F = 0x29,  // dst:u16le cond:u16le t:u16le f:u16le  (9 B)
 
-		OP_FNEG = 0x2C, // dst_fr:u8 src_fr:u8
+		OP_FNEG = 0x2C, // dst_fr:u16le src_fr:u16le  (5 B)
 		// OP_LOAD_F32 / OP_STORE_F32 — 4-byte float memory operations.
-		// OP_LOAD_F   / OP_STORE_F   remain 8-byte (double* only) for f64 source types.
-		// Step 1.6 in run() widens local float allocas to double; these opcodes handle
-		// the remaining cases where the pointer genuinely points to a 4-byte float slot
-		// (e.g. float* function parameters, global float arrays).
-		OP_LOAD_F32 = 0x2D,  // dst:u8 ptrreg:u8  (3 bytes) — load 4-byte float, fpext → freg
-		OP_STORE_F32 = 0x2E,  // val:u8 ptrreg:u8  (3 bytes) — fptrunc freg → store 4-byte float
+		OP_LOAD_F32 = 0x2D,  // dst:u16le ptrreg:u16le  (5 B)
+		OP_STORE_F32 = 0x2E,  // val:u16le ptrreg:u16le  (5 B)
 
 		// ── OP_FCAST_* : split float-cast opcodes (Phase 4) ─────────────────────────────────
-		// Opcode encodes the register-file pair; kind byte selects signed/unsigned (or ext/trunc).
-		// Encoding: opc dst:u8 src:u8 kind:u8 = 4 bytes (same size as old OP_FCAST).
+		// Encoding: opc dst:u16le src:u16le kind:u8 = 6 B
 		OP_FCAST_FV = 0x2F,  // freg  → vreg   i32 : FK_FPTOSI   / FK_FPTOUI
 		OP_FCAST_FV64 = 0x30,  // freg  → vreg64 i64 : FK_FPTOSI64 / FK_FPTOUI64
 		OP_FCAST_VF = 0x31,  // vreg  i32  → freg  : FK_SITOFP   / FK_UITOFP
 		OP_FCAST_V64F = 0x32,  // vreg64 i64 → freg  : FK_SI64TOFP / FK_UI64TOFP
 
-		OP_LOADI64 = 0x33,  // dst64:u8 imm:i64le  (1+1+8 = 10 bytes)
+		OP_LOADI64 = 0x33,  // dst64:u16le imm:i64le  (11 B)
 
-		// superOps: fused super-operator. Replaces `%c = mul i32 %a,%b; %d = add
-		// i32 %c,%e` (mul single-use, consumed directly by the add) with one
-		// opcode so lifting the handler doesn't recover a lone mul or add.
-		OP_MULADD = 0x34,  // dst:u8 a:u8 b:u8 c:u8  (5 bytes) -- dst = a*b + c (i32)
+		OP_MULADD = 0x34,  // dst:u16le a:u16le b:u16le c:u16le  (9 B) -- dst = a*b + c (i32)
+		OP_SHLADD = 0x35,  // dst:u16le a:u16le b:u16le c:u16le  (9 B) -- dst = (a<<b) + c (i32)
+		OP_CMPSEL = 0x36,  // dst:u16le a:u16le b:u16le pred:u8 t:u16le f:u16le  (12 B)
+		OP_ANDCMPZ = 0x37,  // dst:u16le a:u16le b:u16le pred:u8  (8 B)
 
-		// superOps: fused shift-add super-operator. Replaces `%s = shl i32
-		// %a,%b; %d = add i32 %s,%c` (shl single-use, consumed by the add)
-		// with one opcode so lifting recovers neither a lone shl nor add.
-		OP_SHLADD = 0x35,  // dst:u8 a:u8 b:u8 c:u8  (5 bytes) -- dst = (a<<b) + c (i32)
-
-		// superOps: fused compare-select super-operator. Replaces `%c = icmp
-		// <pred> i32 %a,%b; %r = select i1 %c, i32 %t, i32 %f` (icmp single-use
-		// and IS the select condition) with one opcode, hiding the branchless
-		// conditional -- a lifter recovers neither a lone icmp nor select.
-		OP_CMPSEL = 0x36,  // dst:u8 a:u8 b:u8 pred:u8 t:u8 f:u8  (7 bytes) -- dst = (a<pred>b)?t:f (i32)
-
-		// superOps: fused and-compare-zero super-operator. Replaces
-		// `%m = and i32 %a,%b; %r = icmp eq|ne i32 %m, 0` (and single-use,
-		// consumed by the compare) with one opcode so lifting recovers neither
-		// a lone `and` nor the bit-test compare. pred byte is EQ or NE only.
-		OP_ANDCMPZ = 0x37,  // dst:u8 a:u8 b:u8 pred:u8  (5 bytes) -- dst = ((a&b) <eq|ne> 0) (i32 0/1)
-
-		// Pointer compare (eq/ne). Operands are preg indices; result 0/1 → vreg.
-		OP_ICMP_PTR = 0x38,  // dst:u8 a:u8 b:u8 pred:u8  (5 bytes)
+		OP_ICMP_PTR = 0x38,  // dst:u16le a:u16le b:u16le pred:u8  (8 B)
 
 		// Call returning exact {ptr, i64}. Dual dst: preg + vreg64.
-		OP_CALL_PAIR = 0x39,  // dstp:u8 dst64:u8 fn:u8 nargs:u8 [arg:u8 * nargs]
+		OP_CALL_PAIR = 0x39,  // dstp:u16le dst64:u16le fn:u8 nargs:u8 [arg:u16le * nargs]
 
 		// Inverse of OP_PTRTOINT64: inttoptr i64 → preg.
-		OP_INTTOPTR64 = 0x3A,  // dstp:u8 src64:u8
+		OP_INTTOPTR64 = 0x3A,  // dstp:u16le src64:u16le  (5 B)
 
 		OP_COUNT = 0x3B
 	};

@@ -373,7 +373,7 @@ namespace llvm {
 		// per-clone-seeded MBA rewrite (requires EnginePoolSize>1). Off = no rewrite.
 		const bool     MetamorphicEngines;
 		const uint32_t SaltConst;    // full 32-bit salt stored in vm.salt
-		const uint8_t  CTSalt;       // low byte of SaltConst must match deobf() key
+		const uint16_t CTSalt;       // low-16 of SaltConst must match deobf() key
 		// Module-uniform obfuscation seed (Ann.ModuleSeed). Same value for every
 		// function of the module — the derivation source for RandISA's module-wide
 		// operand-encoding permutation (must agree between the shared handler and
@@ -570,7 +570,7 @@ namespace llvm {
 			SaltConst(R.u32()),
 			// IMPORTANT: indices are only XOR-salted when obfRegIdx=1.
 			// When obfRegIdx=0, emitter must write raw indices (CTSalt=0).
-			CTSalt(ObfRegIdx ? (uint8_t)(SaltConst & 0xFF) : 0),
+			CTSalt(ObfRegIdx ? (uint16_t)(SaltConst & 0xFFFF) : 0),
 			MasterSeed(MasterSeedIn) {
 			// per-function opcode permutation for handler-table/bytecode diversity.
 			OpMap.initPermuted(R);
@@ -747,29 +747,43 @@ namespace llvm {
 
 
 
-		// Deobfuscate a register index: (byte XOR salt_lo_byte) & mask
-		Value* deobf(IRBuilder<>& B, Value* Raw8, Value* MaskVal, const Twine& N = "vm.do") {
-			Value* Ext = B.CreateZExt(Raw8, I32Ty, N + ".e");
+		// Deobfuscate a register index: (u16 XOR salt_lo16) & mask
+		Value* deobf(IRBuilder<>& B, Value* Raw16, Value* MaskVal, const Twine& N = "vm.do") {
+			Value* Ext = B.CreateZExt(Raw16, I32Ty, N + ".e");
 			if (ObfRegIdx) {
 				auto* SL = B.CreateLoad(I32Ty, EffSalt, N + ".s"); SL->setVolatile(true);
-				Ext = B.CreateXor(Ext, B.CreateAnd(SL, B.getInt32(0xFF), N + ".sb"), N + ".x");
+				Ext = B.CreateXor(Ext, B.CreateAnd(SL, B.getInt32(0xFFFF), N + ".sb"), N + ".x");
 			}
 			return B.CreateAnd(Ext, MaskVal, N + ".m");
 		}
 
-		// Helpers that read one obfuscated register-index byte at IP+Off
+		// Read little-endian u16 at IP+Off (register-index encoding)
+		Value* loadBC16(IRBuilder<>& B, Value* IP, uint32_t Off, const Twine& N = "vm.bc16") {
+			Value* Lo = B.CreateZExt(loadBC(B, IP, Off, N + ".lo"), I32Ty, N + ".loz");
+			Value* Hi = B.CreateZExt(loadBC(B, IP, Off + 1, N + ".hi"), I32Ty, N + ".hiz");
+			return B.CreateOr(Lo, B.CreateShl(Hi, 8, N + ".s"), N);
+		}
+
+		Value* loadBC16Dyn(IRBuilder<>& B, Value* IP, Value* Off, const Twine& N = "vm.bc16d") {
+			Value* Lo = B.CreateZExt(rdByteDyn(B, IP, Off, N + ".lo"), I32Ty, N + ".loz");
+			Value* Off1 = B.CreateAdd(Off, B.getInt32(1), N + ".o1");
+			Value* Hi = B.CreateZExt(rdByteDyn(B, IP, Off1, N + ".hi"), I32Ty, N + ".hiz");
+			return B.CreateOr(Lo, B.CreateShl(Hi, 8, N + ".s"), N);
+		}
+
+		// Helpers that read one obfuscated register-index u16le at IP+Off
 		Value* rdVR(IRBuilder<>& B, Value* IP, uint32_t Off, const Twine& N) {
-			return deobf(B, loadBC(B, IP, Off, N + ".rb"), MaskVR, N);
+			return deobf(B, loadBC16(B, IP, Off, N + ".rw"), MaskVR, N);
 		}
 		Value* rdVR64(IRBuilder<>& B, Value* IP, uint32_t Off, const Twine& N) {
-			return deobf(B, loadBC(B, IP, Off, N + ".rb"), MaskVR64, N);
+			return deobf(B, loadBC16(B, IP, Off, N + ".rw"), MaskVR64, N);
 		}
 		Value* rdPR(IRBuilder<>& B, Value* IP, uint32_t Off, const Twine& N) {
-			return deobf(B, loadBC(B, IP, Off, N + ".rb"), MaskPR, N);
+			return deobf(B, loadBC16(B, IP, Off, N + ".rw"), MaskPR, N);
 		}
 		// Read a freg slot index (same deobf as integer regs)
 		Value* rdFR(IRBuilder<>& B, Value* IP, uint32_t Off, const Twine& N) {
-			return deobf(B, loadBC(B, IP, Off, N + ".rb"), MaskFR, N);
+			return deobf(B, loadBC16(B, IP, Off, N + ".rw"), MaskFR, N);
 		}
 		// Read a plain byte (no deobf)
 		Value* rdByte(IRBuilder<>& B, Value* IP, uint32_t Off, const Twine& N) {

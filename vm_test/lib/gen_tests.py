@@ -644,6 +644,29 @@ uint32_t obf_target(uint32_t x, uint32_t y) {
 }
 ''', {**BASE_EXPECT, "must_match": BASE_EXPECT["must_match"] + [r"vm\.opc\.call_pair"]})
 
+    # byval aggregate arg (clang: ptr byval(%Arr5)). VM CALL must not drop the
+    # copy — regression for ShaderInst::GetInstSize(std::array by value).
+    write("07_calls", "test_call_byval", r'''
+typedef struct { uint32_t a[5]; } Arr5;
+
+__attribute__((noinline)) static uint32_t sum_arr(Arr5 v) {
+    return v.a[0] + v.a[1] + v.a[2] + v.a[3] + v.a[4];
+}
+
+{ANN}
+uint32_t obf_target(uint32_t x, uint32_t y) {
+    Arr5 v;
+    v.a[0] = x;
+    v.a[1] = y;
+    v.a[2] = x ^ y;
+    v.a[3] = x + y;
+    v.a[4] = 800u;
+    return sum_arr(v);
+}
+''', {**BASE_EXPECT, "must_match": BASE_EXPECT["must_match"] + [
+        r"vm\.opc\.call_int",
+    ]})
+
 
 def cat_legalize():
     write("08_legalize", "test_mem_expand", r'''
@@ -950,6 +973,31 @@ declare void @llvm.memset.p0.i64(ptr nocapture writeonly, i8, i64, i1 immarg)
     )
 
 
+
+def write_regfile_u16_stress(n: int = 300):
+    """Force >255 simultaneously live preg slots (pinned entry allocas)."""
+    lines = ["define i32 @obf_target(i32 %x, i32 %y) {", "entry:"]
+    for i in range(n):
+        lines.append(f"  %a{i} = alloca i32, align 4")
+    for i in range(n):
+        src = "%x" if (i % 2 == 0) else "%y"
+        lines.append(f"  store i32 {src}, ptr %a{i}, align 4")
+    for i in range(n):
+        lines.append(f"  %v{i} = load i32, ptr %a{i}, align 4")
+    lines.append("  %acc0 = xor i32 %v0, %v1")
+    for i in range(2, n):
+        lines.append(f"  %acc{i-1} = xor i32 %acc{i-2}, %v{i}")
+    lines.append(f"  ret i32 %acc{n-2}")
+    lines.append("}")
+    body = chr(10).join(lines) + chr(10)
+    write_ll(
+        "08_legalize",
+        "test_regfile_u16_stress",
+        _ll_header() + body + ll_main_boilerplate(),
+        dict(BASE_EXPECT),
+    )
+
+
 def write_odd_int_ll():
     write_odd_i_narrow()
     # ≤64 and >64 containers via extract/deposit (runtime-proven on install)
@@ -960,6 +1008,7 @@ def write_odd_int_ll():
     # Pass-3 SSA promote path (needs Impl dead-root scrub)
     write_odd_ssa_promote(40)
     write_odd_ssa_promote(56)
+    write_regfile_u16_stress(300)
 
 
 def build_coverage() -> dict:
@@ -1018,7 +1067,8 @@ def build_coverage() -> dict:
         "OP_ICMP_PTR": ["06_ptr/test_icmp_ptr_select"],
         "OP_RET_PTR": ["06_ptr/test_ret_ptr"],
         "OP_CALL_VOID": ["07_calls/test_call_int_void_ptr"],
-        "OP_CALL_INT": ["07_calls/test_call_int_void_ptr", "07_calls/test_call_narrow"],
+        "OP_CALL_INT": ["07_calls/test_call_int_void_ptr", "07_calls/test_call_narrow",
+                        "07_calls/test_call_byval"],
         "OP_CALL_PTR": ["07_calls/test_call_int_void_ptr"],
         "OP_CALL_INT64": ["07_calls/test_call_i64_f"],
         "OP_CALL_F": ["07_calls/test_call_i64_f"],
@@ -1039,6 +1089,7 @@ def build_coverage() -> dict:
             "08_legalize/test_odd_i56_ssa",
             "08_legalize/test_odd_bitfield",
         ],
+        "REGFILE_U16_STRESS": ["08_legalize/test_regfile_u16_stress"],
         "LEGALIZE_ODD_BITFIELD": [
             "08_legalize/test_odd_bitfield",
             "08_legalize/test_odd_i40_bitfield",

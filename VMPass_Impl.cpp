@@ -408,7 +408,9 @@ bool VMImpl::run() {
 	//        D) Int    — abs; umul.with.overflow; ctpop/cttz.
 	//        E) trap / ceil-family → native thunks (__vm_nat_*).
 	//           (va_* not thunked — must stay in the varargs frame.)
-	//      Also: aggregate loads, odd pair calls, switch/int legalize (below).
+	//      Also: byval→plain ptr (below), aggregate loads, odd pair calls,
+	//      switch/int legalize.
+
 	{
 		constexpr uint64_t kMemExpandMax = 4096;
 		// Fully unrolling large copies blows the u8 vreg file; keep a small
@@ -565,6 +567,61 @@ bool VMImpl::run() {
 			for (FreezeInst* FI : Freezes) {
 				FI->replaceAllUsesWith(FI->getOperand(0));
 				FI->eraseFromParent();
+			}
+		}
+
+		// byval → plain ptr. VM CALL rebuilds FunctionType without param attrs,
+		// so a byval callee sees a wrong/empty object (GetInstSize size=1 →
+		// Prefetch/mcast regressions). Materialize the ABI copy, strip byval
+		// on the call and on same-module callees / this function's params.
+		{
+			const DataLayout& DLBV = M.getDataLayout();
+			IRBuilder<> EntryB(&F.getEntryBlock(),
+				F.getEntryBlock().getFirstInsertionPt());
+
+			for (Argument& A : F.args()) {
+				if (!A.hasByValAttr())
+					continue;
+				A.removeAttr(Attribute::ByVal);
+			}
+
+			SmallVector<CallInst*, 32> ByValCalls;
+			for (BasicBlock& BB : F)
+				for (Instruction& I : BB)
+					if (auto* CI = dyn_cast<CallInst>(&I))
+						for (unsigned i = 0, e = CI->arg_size(); i < e; ++i)
+							if (CI->paramHasAttr(i, Attribute::ByVal)) {
+								ByValCalls.push_back(CI);
+								break;
+							}
+
+			for (CallInst* CI : ByValCalls) {
+				IRBuilder<> B(CI);
+				if (Function* Callee = CI->getCalledFunction()) {
+					for (unsigned i = 0, e = Callee->arg_size(); i < e; ++i)
+						if (Callee->hasParamAttribute(i, Attribute::ByVal))
+							Callee->removeParamAttr(i, Attribute::ByVal);
+				}
+				for (unsigned i = 0, e = CI->arg_size(); i < e; ++i) {
+					if (!CI->paramHasAttr(i, Attribute::ByVal))
+						continue;
+					Attribute BV = CI->getParamAttr(i, Attribute::ByVal);
+					Type* BVTy = BV.getValueAsType();
+					if (!BVTy)
+						continue;
+					Align Al = CI->getParamAlign(i).value_or(
+						DLBV.getABITypeAlign(BVTy));
+					AllocaInst* Tmp = EntryB.CreateAlloca(BVTy, nullptr, "byval.tmp");
+					Tmp->setAlignment(Al);
+					Value* Src = CI->getArgOperand(i);
+					Align SrcAl = Al;
+					if (auto* SAI = dyn_cast<AllocaInst>(Src->stripPointerCasts()))
+						SrcAl = SAI->getAlign();
+					B.CreateMemCpy(Tmp, Al, Src, SrcAl,
+						DLBV.getTypeStoreSize(BVTy));
+					CI->setArgOperand(i, Tmp);
+					CI->removeParamAttr(i, Attribute::ByVal);
+				}
 			}
 		}
 

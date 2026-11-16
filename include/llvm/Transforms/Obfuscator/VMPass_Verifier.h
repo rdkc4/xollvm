@@ -26,7 +26,7 @@ namespace llvm {
 
 	/// Verify the bytecode in \p E after a successful BytecodeEmitter::run().
 	///
-	/// \param CTSalt    The per-function XOR salt byte used by the emitter for
+	/// \param CTSalt    The per-function XOR salt low-16 used by the emitter for
 	///                  register-index obfuscation (0 when obfRegIdx is disabled).
 	/// \param OpMap     The per-function opcode permutation map.
 	/// \param OutErr    Populated with a human-readable error on failure.
@@ -34,7 +34,7 @@ namespace llvm {
 	///
 	/// Returns true if the bytecode is structurally valid, false otherwise.
 	bool verifyBytecode(const BytecodeEmitter& E,
-		uint8_t               CTSalt,
+		uint16_t              CTSalt,
 		const VMOpcodeMap& OpMap,
 		std::string& OutErr,
 		uint32_t& OutBadIP,

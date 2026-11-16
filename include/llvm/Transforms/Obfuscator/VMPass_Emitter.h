@@ -58,22 +58,22 @@ namespace llvm {
 	// ============================================================================
 
 	struct BytecodeEmitter {
-		static constexpr uint8_t kInvalidSlot = 0xFF;
-		// Soft cap under the u8 ISA index + kInvalidSlot. Overflow = max-live,
+		static constexpr uint16_t kInvalidSlot = 0xFFFF;
+		// Soft cap under the u16le ISA index + kInvalidSlot. Overflow = max-live,
 		// not instruction count (see free-list reuse in newVR*).
-		// uint8_t slot index in bytecode; leave 255 as sentinel (kInvalidSlot).
-		static constexpr uint8_t kMaxSlots = 255;
+		// uint16_t slot index in bytecode; leave 0xFFFF as sentinel (kInvalidSlot).
+		static constexpr uint16_t kMaxSlots = 4096;
 
 		// ── Output fields — read by VMImpl after a successful run() ─────────
 
 		SmallVector<uint8_t, 1024>       BC;         // raw bytecode bytes
 		DenseMap<BasicBlock*, uint32_t>  BlockIP;    // first IP of each block
-		DenseMap<Value*, uint8_t>        VR;         // i32  SSA value  → vreg   slot
-		DenseMap<Value*, uint8_t>        VR64;       // i64  SSA value  → vreg64 slot
-		DenseMap<Value*, uint8_t>        PR;         // ptr  SSA value  → preg   slot
-		DenseMap<Value*, uint8_t>        FR;         // f64  SSA value  → freg   slot [Step 01.1]
+		DenseMap<Value*, uint16_t>       VR;         // i32  SSA value  → vreg   slot
+		DenseMap<Value*, uint16_t>       VR64;       // i64  SSA value  → vreg64 slot
+		DenseMap<Value*, uint16_t>       PR;         // ptr  SSA value  → preg   slot
+		DenseMap<Value*, uint16_t>       FR;         // f64  SSA value  → freg   slot [Step 01.1]
 		// OP_CALL_PAIR: CallInst → {preg, vreg64}; extractvalue aliases these slots.
-		DenseMap<Value*, std::pair<uint8_t, uint8_t>> PairSlots;
+		DenseMap<Value*, std::pair<uint16_t, uint16_t>> PairSlots;
 		SmallVector<Value*, 8>           CalleeTab;  // callee table (CALL* targets)
 		// 6.2: parallel FunctionType table -- one entry per CalleeTab slot.
 		SmallVector<FunctionType*, 8>    CalleeFTyTab;
@@ -86,7 +86,7 @@ namespace llvm {
 
 		/// Metadata for an entry-block alloca created by PHI demotion.
 		struct PhiAllocaDesc {
-			uint8_t     Slot = 0;       // preg slot assigned to this alloca
+			uint16_t    Slot = 0;       // preg slot assigned to this alloca
 			Type* AllocTy = nullptr;
 			MaybeAlign  A;                // original alignment (if any)
 			std::string Name;             // stable debug-friendly name
@@ -94,15 +94,15 @@ namespace llvm {
 		SmallVector<PhiAllocaDesc, 8>    PHIAllocas;  // demoted PHI allocas, in preg order
 
 		// Pre-load lists built during slot assignment; consumed by VMImpl::buildVMEntry.
-		SmallVector<std::pair<uint8_t, ConstantInt*>, 16>  ImmLoads;    // vreg   slot, ConstantInt (<=32-bit)
-		SmallVector<std::pair<uint8_t, ConstantInt*>, 16>  ImmLoads64;  // vreg64 slot, ConstantInt (i64)
-		SmallVector<std::pair<uint8_t, Value*>, 16> PtrLoads;    // preg   slot, global/null ptr
-		SmallVector<std::pair<uint8_t, ConstantFP*>, 8>  ImmLoadsF;   // freg   slot, ConstantFP (f64/f32) [Step 01.1]
+		SmallVector<std::pair<uint16_t, ConstantInt*>, 16> ImmLoads;    // vreg   slot, ConstantInt (<=32-bit)
+		SmallVector<std::pair<uint16_t, ConstantInt*>, 16> ImmLoads64;  // vreg64 slot, ConstantInt (i64)
+		SmallVector<std::pair<uint16_t, Value*>, 16> PtrLoads;   // preg   slot, global/null ptr
+		SmallVector<std::pair<uint16_t, ConstantFP*>, 8> ImmLoadsF;  // freg   slot, ConstantFP (f64/f32) [Step 01.1]
 
-		uint8_t NVR = 0;  // vreg   high-water (max live)
-		uint8_t NVR64 = 0;  // vreg64 high-water (max live)
-		uint8_t NPR = 0;  // preg   high-water (max live)
-		uint8_t NFR = 0;  // freg   high-water (max live)
+		uint16_t NVR = 0;  // vreg   high-water (max live)
+		uint16_t NVR64 = 0;  // vreg64 high-water (max live)
+		uint16_t NPR = 0;  // preg   high-water (max live)
+		uint16_t NFR = 0;  // freg   high-water (max live)
 
 
 		// When an instruction cannot be virtualised Unsupported is set and run()
@@ -143,13 +143,13 @@ namespace llvm {
 		/// module-wide instance the shared handler switch-cases were built from.
 		void setISAEnc(const ISAEnc* E) { IsaEnc = E; }
 
-		/// Compile F into bytecode.  Salt is the CTSalt byte used to XOR register
-		/// index bytes (0 when obfRegIdx is disabled).
+		/// Compile F into bytecode.  Salt is the CTSalt low-16 used to XOR register
+		/// index words (0 when obfRegIdx is disabled).
 		/// Returns false on failure; FailReason is populated.
-		bool run(Function& F, uint8_t Salt, const DataLayout& DL);
+		bool run(Function& F, uint16_t Salt, const DataLayout& DL);
 
 	private:
-		uint8_t            Salt = 0;
+		uint16_t           Salt = 0;
 		const DataLayout* DL = nullptr;
 		const VMOpcodeMap* OpMap = nullptr;
 		uint32_t           SaltFull = 0;
@@ -254,10 +254,10 @@ namespace llvm {
 		// (args, entry allocas, constants, OP_CALL_PAIR aliases) never release.
 		// LastUseInBB: last semantic consumer per block (skipped superOps are
 		// not consumers; fused extras are attributed to the consumer).
-		SmallVector<uint8_t, 32> FreeVR;
-		SmallVector<uint8_t, 32> FreeVR64;
-		SmallVector<uint8_t, 32> FreePR;
-		SmallVector<uint8_t, 32> FreeFR;
+		SmallVector<uint16_t, 32> FreeVR;
+		SmallVector<uint16_t, 32> FreeVR64;
+		SmallVector<uint16_t, 32> FreePR;
+		SmallVector<uint16_t, 32> FreeFR;
 		DenseSet<Value*>         Pinned;
 		DenseSet<Value*>         Released; // idempotent releaseValue (fused+operand overlap)
 		DenseMap<BasicBlock*, SmallPtrSet<Value*, 16>> LiveOut;
@@ -267,7 +267,7 @@ namespace llvm {
 
 		// Bump high-water only — for values that must stay valid from function
 		// entry (args already allocated pre-reuse; constants / PtrLoads).
-		uint8_t takeFreshSlot(uint8_t& HighWater, const char* OverflowMsg) {
+		uint16_t takeFreshSlot(uint16_t& HighWater, const char* OverflowMsg) {
 			if (HighWater >= kMaxSlots) {
 				Unsupported = true;
 				if (FailReason.empty()) {
@@ -279,7 +279,7 @@ namespace llvm {
 			return HighWater++;
 		}
 
-		uint8_t takeSlot(uint8_t& HighWater, SmallVectorImpl<uint8_t>& Free,
+		uint16_t takeSlot(uint16_t& HighWater, SmallVectorImpl<uint16_t>& Free,
 			const char* OverflowMsg) {
 			if (!Free.empty())
 				return Free.pop_back_val();
@@ -297,7 +297,7 @@ namespace llvm {
 			// Only mark Released when a real slot is returned — otherwise a
 			// premature tryRel (use visited before def in walk order) would
 			// poison V and permanently leak its later-allocated slot.
-			auto push = [&](SmallVectorImpl<uint8_t>& Free, uint8_t S) {
+			auto push = [&](SmallVectorImpl<uint16_t>& Free, uint16_t S) {
 				Released.insert(V);
 				Free.push_back(S);
 			};
@@ -386,29 +386,29 @@ namespace llvm {
 
 		// ── Idempotent slot allocation (safe to call in both passes) ─────────
 
-		uint8_t newVR(Value* V) {
+		uint16_t newVR(Value* V) {
 			auto It = VR.find(V);
 			if (It != VR.end()) return It->second;
-			uint8_t S = takeSlot(NVR, FreeVR, "vreg file overflow (>254 slots)");
+			uint16_t S = takeSlot(NVR, FreeVR, "vreg file overflow (>4095 slots)");
 			if (S == kInvalidSlot) return S;
 			VR[V] = S;
 			return S;
 		}
 
-		uint8_t newVR64(Value* V) {
+		uint16_t newVR64(Value* V) {
 			auto It = VR64.find(V);
 			if (It != VR64.end()) return It->second;
-			uint8_t S = takeSlot(NVR64, FreeVR64, "vreg64 file overflow (>254 slots)");
+			uint16_t S = takeSlot(NVR64, FreeVR64, "vreg64 file overflow (>4095 slots)");
 			if (S == kInvalidSlot) return S;
 			VR64[V] = S;
 			return S;
 		}
 
 
-		uint8_t newPR(Value* V) {
+		uint16_t newPR(Value* V) {
 			auto It = PR.find(V);
 			if (It != PR.end()) return It->second;
-			uint8_t S = takeSlot(NPR, FreePR, "preg file overflow (>254 slots)");
+			uint16_t S = takeSlot(NPR, FreePR, "preg file overflow (>4095 slots)");
 			if (S == kInvalidSlot) return S;
 			PR[V] = S;
 			return S;
@@ -416,10 +416,10 @@ namespace llvm {
 
 		// Scratch preg for multi-op expansions (e.g. store {ptr,i64}); not tied
 		// to an SSA value. Caller must freeScratchPR after the expansion.
-		uint8_t allocScratchPR() {
-			return takeSlot(NPR, FreePR, "preg file overflow (>254 slots)");
+		uint16_t allocScratchPR() {
+			return takeSlot(NPR, FreePR, "preg file overflow (>4095 slots)");
 		}
-		void freeScratchPR(uint8_t S) {
+		void freeScratchPR(uint16_t S) {
 			if (S != kInvalidSlot) FreePR.push_back(S);
 		}
 
@@ -429,16 +429,16 @@ namespace llvm {
 		// are widened to f64 on slot assignment and narrowed to f32 on STORE_F /
 		// RET_F by the handler, transparently to the bytecode encoding.
 
-		uint8_t newFR(Value* V) {
+		uint16_t newFR(Value* V) {
 			auto It = FR.find(V);
 			if (It != FR.end()) return It->second;
-			uint8_t S = takeSlot(NFR, FreeFR, "freg file overflow (>254 slots)");
+			uint16_t S = takeSlot(NFR, FreeFR, "freg file overflow (>4095 slots)");
 			if (S == kInvalidSlot) return S;
 			FR[V] = S;
 			return S;
 		}
 
-		uint8_t xorSalt(uint8_t S) const { return S ^ Salt; }
+		uint16_t xorSalt(uint16_t S) const { return (uint16_t)(S ^ Salt); }
 
 		void setFail(StringRef R) { if (FailReason.empty()) FailReason = R.str(); }
 
@@ -477,14 +477,14 @@ namespace llvm {
 		// ── Slot resolution with constant materialisation ────────────────────
 
 		// resolve vreg slot, materialising ConstantInt on first use
-		uint8_t vr(Value* V) {
+		uint16_t vr(Value* V) {
 			if (auto* CI = dyn_cast<ConstantInt>(V)) {
 				if (CI->getType()->getIntegerBitWidth() > 32) { markUnsupportedValue(V); return 0; }
 				auto It = VR.find(V);
 				if (It != VR.end()) return It->second;
 				// Fresh slot only: ImmLoads / prologue seed at entry; a recycled
 				// index would still be written by the SSA def that freed it.
-				uint8_t S = takeFreshSlot(NVR, "vreg file overflow (>254 slots)");
+				uint16_t S = takeFreshSlot(NVR, "vreg file overflow (>4095 slots)");
 				if (S == kInvalidSlot) return S;
 				VR[V] = S;
 				pin(V);
@@ -496,12 +496,12 @@ namespace llvm {
 			return It->second;
 		}
 
-		uint8_t vr64(Value* V) {
+		uint16_t vr64(Value* V) {
 			if (auto* CI = dyn_cast<ConstantInt>(V)) {
 				if (!CI->getType()->isIntegerTy(64)) { markUnsupportedValue(V); return 0; }
 				auto It = VR64.find(V);
 				if (It != VR64.end()) return It->second;
-				uint8_t S = takeFreshSlot(NVR64, "vreg64 file overflow (>254 slots)");
+				uint16_t S = takeFreshSlot(NVR64, "vreg64 file overflow (>4095 slots)");
 				if (S == kInvalidSlot) return S;
 				VR64[V] = S;
 				pin(V);
@@ -514,11 +514,11 @@ namespace llvm {
 		}
 
 		// resolve preg slot, materialising ptr constant on first use
-		uint8_t pr(Value* V) {
+		uint16_t pr(Value* V) {
 			auto It = PR.find(V);
 			if (It != PR.end()) return It->second;
 			assert(isa<Constant>(V) && "pr(): untracked non-const ptr");
-			uint8_t S = takeFreshSlot(NPR, "preg file overflow (>254 slots)");
+			uint16_t S = takeFreshSlot(NPR, "preg file overflow (>4095 slots)");
 			if (S == kInvalidSlot) return S;
 			PR[V] = S;
 			pin(V);
@@ -532,7 +532,7 @@ namespace llvm {
 		// Both f32 and f64 ConstantFP values are accepted — the handler widens
 		// f32 to f64 when loading the slot via OP_LOADI_F (ImmLoadsF path).
 
-		uint8_t fr(Value* V) {
+		uint16_t fr(Value* V) {
 			if (auto* CFP = dyn_cast<ConstantFP>(V)) {
 				Type* Ty = CFP->getType();
 				if (!Ty->isFloatTy() && !Ty->isDoubleTy()) {
@@ -541,7 +541,7 @@ namespace llvm {
 				}
 				auto It = FR.find(V);
 				if (It != FR.end()) return It->second;
-				uint8_t S = takeFreshSlot(NFR, "freg file overflow (>254 slots)");
+				uint16_t S = takeFreshSlot(NFR, "freg file overflow (>4095 slots)");
 				if (S == kInvalidSlot) return S;
 				FR[V] = S;
 				pin(V);
@@ -613,6 +613,7 @@ namespace llvm {
 
 		void     b8(uint8_t v) { BC.push_back(v); }
 		void     u16(uint16_t v) { b8(v & 0xFF); b8(v >> 8); }
+		void     b16(uint16_t v) { u16(v); }  // register-index emit alias
 		void     u32(uint32_t v) { b8(v); b8(v >> 8); b8(v >> 16); b8(v >> 24); }
 		void     u64(uint64_t v) { u32((uint32_t)v); u32((uint32_t)(v >> 32)); }
 		uint32_t ip() const { return (uint32_t)BC.size(); }

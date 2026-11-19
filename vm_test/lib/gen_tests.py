@@ -697,6 +697,43 @@ uint32_t obf_target(uint32_t x, uint32_t y) {
         r"vm\.opc\.call_int",
     ]})
 
+    # Nested-VM helpers must not found shared __vm_engine with regEncrypt while
+    # a later plain vm() wrapper passes null key ptrs (SIGSEGV).
+    # contaminate_engine runs first (module order): nestedVM+hardened -> helpers
+    # target engine 0; obf_target is plain vm with many CALL_VOID (ptr+i32).
+    write("07_calls", "test_nested_regencrypt_isolation", r'''
+__attribute__((noinline, annotate("obf: vm(nestedVM=1,hardened=1)")))
+uint32_t contaminate_engine(uint32_t x, uint32_t y) {
+    uint32_t a = x + y;
+    uint32_t b = x * (y | 1u);
+    uint32_t c = (a < b) ? a : b;
+    return a ^ b ^ c;
+}
+
+__attribute__((noinline)) static void fill_param(uint32_t *p,
+                                                 uint32_t a, uint32_t b, uint32_t c,
+                                                 uint32_t d, uint32_t e, uint32_t f) {
+    p[0] = a; p[1] = b; p[2] = c; p[3] = d; p[4] = e; p[5] = f;
+}
+
+{ANN}
+uint32_t obf_target(uint32_t x, uint32_t y) {
+    uint32_t params[12];
+    uint32_t a0 = 23, a1 = 24, a2 = 4, a3 = 25, a4 = 0xffffffffu, a5 = 0;
+    uint32_t b0 = 18, b1 = 26, b2 = 5, b3 = 0, b4 = 0, b5 = 0;
+    uint32_t c0 = 22, c1 = 26, c2 = 5, c3 = 1, c4 = 1, c5 = 0;
+    fill_param(&params[0], a0, a1, a2, a3, a4, a5);
+    fill_param(&params[6], b0, b1, b2, b3, b4, b5);
+    fill_param(&params[0], c0, c1, c2, c3, c4, c5);
+    fill_param(&params[6], x, y, x ^ y, x + y, 1u, 2u);
+    uint32_t acc = 0;
+    for (int i = 0; i < 12; i++) acc ^= params[i] + (uint32_t)i;
+    return acc ^ contaminate_engine(x, y);
+}
+''', {**BASE_EXPECT, "must_match": BASE_EXPECT["must_match"] + [
+        r"vm\.opc\.call_void",
+    ]})
+
 
 def cat_legalize():
     write("08_legalize", "test_mem_expand", r'''
@@ -1096,7 +1133,8 @@ def build_coverage() -> dict:
         "OP_INTTOPTR64": ["06_ptr/test_ptrtoint_inttoptr"],
         "OP_ICMP_PTR": ["06_ptr/test_icmp_ptr_select"],
         "OP_RET_PTR": ["06_ptr/test_ret_ptr"],
-        "OP_CALL_VOID": ["07_calls/test_call_int_void_ptr"],
+        "OP_CALL_VOID": ["07_calls/test_call_int_void_ptr",
+                         "07_calls/test_nested_regencrypt_isolation"],
         "OP_CALL_INT": ["07_calls/test_call_int_void_ptr", "07_calls/test_call_narrow",
                         "07_calls/test_call_byval"],
         "OP_CALL_PTR": ["07_calls/test_call_int_void_ptr"],
@@ -1130,6 +1168,7 @@ def build_coverage() -> dict:
         "SHELL_VARARGS": ["09_shells/test_varargs_split"],
         "SHELL_SRET": ["09_shells/test_sret_odd_pair"],
         "SHELL_NAT": ["09_shells/test_nat_math"],
+        "NESTED_REGENCRYPT_ISOLATION": ["07_calls/test_nested_regencrypt_isolation"],
     }
     odd_widths = {
         "3": ["08_legalize/test_odd_i3_i5"],

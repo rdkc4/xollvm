@@ -558,7 +558,13 @@ void VMImpl::virtualizeNestedHelpersOnce() {
 	if (SS->NestedHelpersBuilt) return;
 	SS->NestedHelpersBuilt = true;
 
-	VMPassConfig InnerCfg = Cfg;
+	// Helpers target shared plain __vm_engine (engine 0), which later plain
+	// vm() functions also use. Do NOT copy OuterCfg from preset=max: that
+	// leaked lazyDecrypt (19-arg engine ABI), randISA, regEncrypt, K=4, etc.
+	// into engine 0 while plain wrappers assume default vm() knobs -> SIGSEGV.
+	// Start from defaults matching plain vm().
+	VMPassConfig InnerCfg;
+	InnerCfg.enable = true;
 	InnerCfg.nestedVM = false; // hard recursion guard: no helper is ever itself nested
 	InnerCfg.minBlocks = 1;    // helper is a single small switch
 	// NOTE: NestedVMHardened is reserved. Hardening the helper's thin wrapper
@@ -566,6 +572,19 @@ void VMImpl::virtualizeNestedHelpersOnce() {
 	// invalid IR on the helper's small wrapper shape; left off until that is
 	// fixed. The distinct inner engine already provides the second layer.
 	InnerCfg.hardened = false;
+	InnerCfg.regEncrypt = false;
+	InnerCfg.rollingRegKey = false;
+	InnerCfg.lazyDecrypt = false;
+	InnerCfg.randISA = false;
+	InnerCfg.constInStream = false;
+	InnerCfg.threadedDispatch = false;
+	InnerCfg.keyedDispatch = false;
+	InnerCfg.perFnEngine = false;
+	InnerCfg.metamorphicEngines = false;
+	InnerCfg.bindAntiDebug = false;
+	InnerCfg.handlerDecoys = 0;
+	// Keep default handlerVariants/encBytecode/obfRegIdx/strongBytecode/blindTargets
+	// (same as unannotated-knob plain vm()).
 
 	for (unsigned i = 0; i < kNumNestedHelpers; ++i) {
 		Function* HelperFn = M.getFunction(kNestedHelperOrder[i].Name);

@@ -810,20 +810,47 @@ namespace llvm {
 				B.getInt64(0x2545F4914F6CDD1Dull), "vm.rk64.ev");
 		}
 
+		// Runtime null key ptr = encryption off (param contract). Eff*Keys is an
+		// Argument* at handler build time, so `!Eff*Keys` is not a runtime check.
+		// Select a private zero array so XOR is identity instead of SIGSEGV.
+		Value* keyArrayBase(IRBuilder<>& B, Value* Keys, Type* ElemTy, const Twine& Name) {
+			auto* ArrTy = ArrayType::get(ElemTy, BytecodeEmitter::kMaxSlots);
+			const char* kName = ElemTy->isIntegerTy(32) ? "__vm_zero_regkeys32"
+													   : "__vm_zero_regkeys64";
+			GlobalVariable* Zero = M.getGlobalVariable(kName, /*AllowLocal=*/true);
+			if (!Zero) {
+				Zero = new GlobalVariable(M, ArrTy, /*isConstant=*/true,
+					GlobalValue::PrivateLinkage, Constant::getNullValue(ArrTy), kName);
+				Zero->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+			}
+			Value* ZBase = B.CreateGEP(ArrTy, Zero, { B.getInt32(0), B.getInt32(0) }, "vm.zk");
+			Value* IsNull = B.CreateICmpEQ(Keys,
+				ConstantPointerNull::get(cast<PointerType>(Keys->getType())), Name + ".nil");
+			return B.CreateSelect(IsNull, ZBase, Keys, Name + ".b");
+		}
+		Value* loadRegKey32(IRBuilder<>& B, Value* Keys, Value* Idx) {
+			Value* Base = keyArrayBase(B, Keys, I32Ty, "vm.rk");
+			return B.CreateLoad(I32Ty, B.CreateGEP(I32Ty, Base, Idx, "vm.rk.p"), "vm.rk.v");
+		}
+		Value* loadRegKey64(IRBuilder<>& B, Value* Keys, Value* Idx, const Twine& Name) {
+			Value* Base = keyArrayBase(B, Keys, I64Ty, Name);
+			return B.CreateLoad(I64Ty, B.CreateGEP(I64Ty, Base, Idx, Name + ".p"), Name + ".v");
+		}
+
 		// Load/store virtual registers
 		Value* ldVR(IRBuilder<>& B, Value* Idx) {
 			Value* Raw = B.CreateLoad(I32Ty, B.CreateGEP(I32Ty, EffRegs, Idx, "vm.rg.p"), "vm.rg.v");
 			if (!RegEncrypt || !EffRegKeys) return Raw;
-			Value* Key = B.CreateLoad(I32Ty,
-				B.CreateGEP(I32Ty, EffRegKeys, Idx, "vm.rk.p"), "vm.rk.v");
-			return B.CreateXor(Raw, Key, "vm.rg.dec");
+			return B.CreateXor(Raw, loadRegKey32(B, EffRegKeys, Idx), "vm.rg.dec");
 		}
 		void stVR(IRBuilder<>& B, Value* Idx, Value* V) {
 			if (V->getType() != I32Ty && V->getType()->isIntegerTy())
 				V = B.CreateZExt(V, I32Ty, "vm.rg.w");
 			if (RegEncrypt && EffRegKeys) {
+				// Null keys -> XOR 0 (identity). Rolling writeback stays on EffRegKeys;
+				// nested helpers clear rollingRegKey on shared engine 0.
 				Value* KPtr = B.CreateGEP(I32Ty, EffRegKeys, Idx, "vm.rk.p");
-				Value* Key = B.CreateLoad(I32Ty, KPtr, "vm.rk.v");
+				Value* Key = loadRegKey32(B, EffRegKeys, Idx);
 				if (RollingRegKey) {
 					Key = evolveKey32(B, Key);
 					B.CreateStore(Key, KPtr);
@@ -835,16 +862,14 @@ namespace llvm {
 		Value* ldVR64(IRBuilder<>& B, Value* Idx) {
 			Value* Raw = B.CreateLoad(I64Ty, B.CreateGEP(I64Ty, EffRegs64, Idx, "vm.rg64.p"), "vm.rg64.v");
 			if (!RegEncrypt || !EffReg64Keys) return Raw;
-			Value* Key = B.CreateLoad(I64Ty,
-				B.CreateGEP(I64Ty, EffReg64Keys, Idx, "vm.rk64.p"), "vm.rk64.v");
-			return B.CreateXor(Raw, Key, "vm.rg64.dec");
+			return B.CreateXor(Raw, loadRegKey64(B, EffReg64Keys, Idx, "vm.rk64"), "vm.rg64.dec");
 		}
 		void stVR64(IRBuilder<>& B, Value* Idx, Value* V) {
 			if (V->getType() != I64Ty && V->getType()->isIntegerTy())
 				V = B.CreateZExtOrTrunc(V, I64Ty, "vm.rg64.w");
 			if (RegEncrypt && EffReg64Keys) {
 				Value* KPtr64 = B.CreateGEP(I64Ty, EffReg64Keys, Idx, "vm.rk64.p");
-				Value* Key = B.CreateLoad(I64Ty, KPtr64, "vm.rk64.v");
+				Value* Key = loadRegKey64(B, EffReg64Keys, Idx, "vm.rk64");
 				if (RollingRegKey) {
 					Key = evolveKey64(B, Key);
 					B.CreateStore(Key, KPtr64);
@@ -866,8 +891,7 @@ namespace llvm {
 			if (!RegEncrypt || !EffFRegKeys) return Raw;
 			// XOR on the i64 bit-pattern, then bitcast back to f64
 			Value* RawBits = B.CreateBitCast(Raw, I64Ty, "vm.fg.bits");
-			Value* Key = B.CreateLoad(I64Ty,
-				B.CreateGEP(I64Ty, EffFRegKeys, Idx, "vm.fk.p"), "vm.fk.v");
+			Value* Key = loadRegKey64(B, EffFRegKeys, Idx, "vm.fk");
 			Value* Dec = B.CreateXor(RawBits, Key, "vm.fg.dec");
 			return B.CreateBitCast(Dec, DoubleTy, "vm.fg.val");
 		}
@@ -875,10 +899,9 @@ namespace llvm {
 			// Widen f32 to f64 if needed so freg always holds DoubleTy
 			if (V->getType()->isFloatTy()) V = B.CreateFPExt(V, DoubleTy, "vm.fg.w");
 			if (RegEncrypt && EffFRegKeys) {
-				// XOR on the i64 bit-pattern, then bitcast back to f64
 				Value* Bits = B.CreateBitCast(V, I64Ty, "vm.fg.bits");
 				Value* KPtr = B.CreateGEP(I64Ty, EffFRegKeys, Idx, "vm.fk.p");
-				Value* Key = B.CreateLoad(I64Ty, KPtr, "vm.fk.v");
+				Value* Key = loadRegKey64(B, EffFRegKeys, Idx, "vm.fk");
 				if (RollingRegKey) {
 					Key = evolveKey64(B, Key);
 					B.CreateStore(Key, KPtr);

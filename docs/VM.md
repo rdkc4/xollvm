@@ -329,7 +329,7 @@ passed through a per-function permutation (see [Opcode permutation](#opcode-perm
 | `OP_MOVR` | 0x01 | `opc dst:u16le src:u16le` (3 B) | Copy vreg to vreg. |
 | `OP_BINOP` | 0x02 | `opc dst:u16le a:u16le b:u16le subop:u8` (5 B) | Binary integer op on vregs (all integer `BW≤32`, incl. i1/i8/i16). See BinSubop table. |
 | `OP_ICMP` | 0x03 | `opc dst:u16le a:u16le b:u16le pred:u8` (5 B) | Integer compare on i32-file values (all integer `BW≤32`, incl. i1/i8/i16); result (0/1) into vreg. |
-| `OP_ICMP_PTR` | 0x38 | `opc dst:u16le a:u16le b:u16le pred:u8` (5 B) | Pointer compare (`eq`/`ne`); preg×preg → vreg 0/1. |
+| `OP_ICMP_PTR` | 0x38 | `opc dst:u16le a:u16le b:u16le pred:u8` (5 B) | Pointer compare (all icmp preds); preg×preg → vreg 0/1. |
 | `OP_CAST` | 0x04 | `opc dst:u16le src:u16le kind:u8` (4 B) | Integer widening/narrowing within the i32 file (incl. `zext i1→i8`). See CastKind table. |
 | `OP_PTRTOINT` | 0x05 | `opc dst:u16le srcp:u16le` (3 B) | `ptrtoint` preg → vreg (i32). |
 | `OP_INTTOPTR` | 0x06 | `opc dstp:u16le src:u16le` (3 B) | `inttoptr` vreg (i32) → preg. |

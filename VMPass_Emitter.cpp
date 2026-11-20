@@ -113,10 +113,8 @@ uint32_t BytecodeEmitter::isize(Instruction* I) {
 			T0->getIntegerBitWidth() == T1->getIntegerBitWidth())
 			return 5;
 		if (T0->isIntegerTy(64) && T1->isIntegerTy(64)) return 5;
-		if (T0->isPointerTy() && T1->isPointerTy()) {
-			auto P = CI->getPredicate();
-			if (P == ICmpInst::ICMP_EQ || P == ICmpInst::ICMP_NE) return 5;
-		}
+		if (T0->isPointerTy() && T1->isPointerTy())
+			return 5;
 		markUnsupported(I); return 0;
 	}
 
@@ -705,15 +703,11 @@ void BytecodeEmitter::emit(Instruction* I) {
 
 		}
 		if (T0->isPointerTy() && T1->isPointerTy()) {
-			auto P = CI->getPredicate();
-			if (P != ICmpInst::ICMP_EQ && P != ICmpInst::ICMP_NE) {
-				markUnsupported(I); return;
-			}
 			bop(OP_ICMP_PTR);
 			b16(xorSalt(newVR(I)));
 			b16(xorSalt(pr(CI->getOperand(0))));
 			b16(xorSalt(pr(CI->getOperand(1))));
-			b8(encIcmpPred((uint8_t)P));
+			b8(encIcmpPred((uint8_t)CI->getPredicate()));
 			return;
 		}
 

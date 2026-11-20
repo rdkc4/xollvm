@@ -378,7 +378,7 @@ void VMImpl::buildHandlersIntArith() {
 		}
 	}
 
-	//  OP_ICMP_PTR -- [dst:u8 a:u8 b:u8 pred:u8]  preg×preg → vreg 0/1 (eq/ne)
+	//  OP_ICMP_PTR -- [dst:u16le a:u16le b:u16le pred:u8]  preg×preg → vreg 0/1
 	{
 		auto B = mkOpc(OP_ICMP_PTR, "icmp_ptr");
 		Value* IP = advIP(B, 7);
@@ -388,11 +388,18 @@ void VMImpl::buildHandlersIntArith() {
 		Value* Pred = rdByte(B, IP, 6, "vm.icp.p");
 		Value* AV = ldPR(B, AIdx), * BV = ldPR(B, BIdx);
 		using P = CmpInst::Predicate;
-		Value* Eq = B.CreateICmpEQ(AV, BV, "vm.icp.eq");
-		Value* Ne = B.CreateICmpNE(AV, BV, "vm.icp.ne");
-		Value* R = B.CreateSelect(
-			B.CreateICmpEQ(Pred, B.getInt32(IsaEnc.encIcmpPred((uint8_t)P::ICMP_EQ))),
-			Eq, Ne, "vm.icp.r");
+		Value* Cs[] = {
+		  B.CreateICmpEQ(AV,BV), B.CreateICmpNE(AV,BV),
+		  B.CreateICmpUGT(AV,BV), B.CreateICmpUGE(AV,BV),
+		  B.CreateICmpULT(AV,BV), B.CreateICmpULE(AV,BV),
+		  B.CreateICmpSGT(AV,BV), B.CreateICmpSGE(AV,BV),
+		  B.CreateICmpSLT(AV,BV), B.CreateICmpSLE(AV,BV),
+		};
+		P Ps[] = { P::ICMP_EQ,P::ICMP_NE,P::ICMP_UGT,P::ICMP_UGE,P::ICMP_ULT,
+				P::ICMP_ULE,P::ICMP_SGT,P::ICMP_SGE,P::ICMP_SLT,P::ICMP_SLE };
+		Value* R = B.getInt1(false);
+		for (unsigned i = 0; i < 10; i++)
+			R = B.CreateSelect(B.CreateICmpEQ(Pred, B.getInt32(IsaEnc.encIcmpPred((uint8_t)Ps[i]))), Cs[i], R, "vm.icp.r");
 		stVR(B, Dst, B.CreateZExt(R, I32Ty, "vm.icp.z"));
 		nextInsn(B);
 	}

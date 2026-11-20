@@ -564,6 +564,28 @@ uint32_t obf_target(uint32_t x, uint32_t y) {
         r"vm\.opc\.icmp_ptr", r"vm\.opc\.select",
     ]})
 
+    # Relational icmp on ptr (ugt/ult/uge/ule) — same-object array elems so C
+    # is defined; previously emitter rejected anything but eq/ne. Do not fold
+    # absolute pointer bits into the return (ASLR differs base vs obf exees).
+    write("06_ptr", "test_icmp_ptr_rel", r'''
+{ANN}
+uint32_t obf_target(uint32_t x, uint32_t y) {
+    uint32_t a[8];
+    for (uint32_t i = 0; i < 8; i++) a[i] = x + i * (y | 1u);
+    uint32_t *lo = &a[0];
+    uint32_t *hi = &a[1u + (x & 3u)];
+    uint32_t r = 0;
+    r += (hi > lo);
+    r += (lo < hi);
+    r += (hi >= lo);
+    r += (lo <= hi);
+    r += (lo > hi);
+    return r ^ a[0] ^ *hi;
+}
+''', {**BASE_EXPECT, "must_match": BASE_EXPECT["must_match"] + [
+        r"vm\.opc\.icmp_ptr",
+    ]})
+
     write("06_ptr", "test_ret_ptr", r'''
 static uint32_t SLOT;
 
@@ -1131,7 +1153,7 @@ def build_coverage() -> dict:
         "OP_PTRTOINT64": ["06_ptr/test_ptrtoint_inttoptr"],
         "OP_INTTOPTR": ["06_ptr/test_ptrtoint_inttoptr"],
         "OP_INTTOPTR64": ["06_ptr/test_ptrtoint_inttoptr"],
-        "OP_ICMP_PTR": ["06_ptr/test_icmp_ptr_select"],
+        "OP_ICMP_PTR": ["06_ptr/test_icmp_ptr_select", "06_ptr/test_icmp_ptr_rel"],
         "OP_RET_PTR": ["06_ptr/test_ret_ptr"],
         "OP_CALL_VOID": ["07_calls/test_call_int_void_ptr",
                          "07_calls/test_nested_regencrypt_isolation"],
